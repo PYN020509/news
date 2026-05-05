@@ -1,0 +1,23 @@
+# 西石大新闻爬虫系统 - Python依赖包清单
+# 安装命令：pip3 install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+
+# 数据库连接
+pymysql
+
+# HTTP请求和网页解析
+requests
+lxml
+urllib3
+
+# PDF生成（浏览器自动化）
+playwright
+
+# 注意：安装playwright后还需要执行以下命令安装浏览器：
+#playwright install chromium
+#sudo playwright install-deps
+
+
+#启动命令
+nohup python3 MY.py > news.log 2>&1 &
+
+
