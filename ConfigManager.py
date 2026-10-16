@@ -1,270 +1,180 @@
-from typing import Dict, List, Optional, Any
+import json
+import os
+from pathlib import Path
+import re
+from typing import Any, Dict, List, Optional
+
+
+def load_image_configuration(file_path=None, environment=None):
+    """先读取镜像专用配置；进程环境优先，禁止插值和回显现场值。"""
+    target = os.environ if environment is None else environment
+    explicit = file_path is not None or bool(target.get("NEWS_CONFIG_FILE"))
+    path = Path(file_path or target.get("NEWS_CONFIG_FILE") or "/app/config/news.env")
+    if not path.exists():
+        if explicit:
+            raise RuntimeError("指定的镜像配置文件不存在")
+        return False
+    try:
+        if not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise RuntimeError("镜像配置必须为不超过一兆字节的普通文件")
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        raise RuntimeError("镜像配置文件不可读取或不是有效 UTF-8 文本") from None
+
+    def value_text(name, value):
+        if not re.fullmatch(r"(?:NEWS_|ERMS_)[A-Z0-9_]+|TZ", name):
+            raise RuntimeError("镜像配置包含非采集服务参数")
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            value = str(value)
+        if not isinstance(value, str) or "\x00" in value:
+            raise RuntimeError("镜像配置参数类型不正确：" + name)
+        return value
+
+    def unique_values(pairs):
+        values = {}
+        for name, value in pairs:
+            if name in values:
+                raise RuntimeError("镜像配置存在重复参数")
+            values[name] = value
+        return values
+
+    def reject_constant(_value):
+        raise ValueError("镜像 JSON 配置不允许非有限数值")
+
+    values = {}
+    if path.suffix.lower() == ".json":
+        try:
+            parsed = json.loads(text, object_pairs_hook=unique_values, parse_constant=reject_constant)
+        except (ValueError, TypeError):
+            raise RuntimeError("镜像配置不是有效 JSON") from None
+        if not isinstance(parsed, dict):
+            raise RuntimeError("镜像 JSON 配置必须是参数对象")
+        for name, value in parsed.items():
+            values[name] = value_text(name, value)
+    else:
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.fullmatch(r"([A-Z][A-Z0-9_]*)\s*=(.*)", line)
+            if not match:
+                raise RuntimeError(f"镜像配置第 {line_number} 行格式不正确")
+            name, value = match.groups()
+            if name in values:
+                raise RuntimeError(f"镜像配置第 {line_number} 行参数重复")
+            value = value.strip()
+            if value.startswith('"'):
+                try:
+                    value, ending = json.JSONDecoder().raw_decode(value)
+                    trailing = match.group(2).strip()[ending:].strip()
+                    if not isinstance(value, str) or (trailing and not trailing.startswith("#")):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    raise RuntimeError(f"镜像配置第 {line_number} 行双引号字符串不正确") from None
+            elif value.startswith("'"):
+                ending = value.find("'", 1)
+                if ending < 0 or (value[ending + 1:].strip() and not value[ending + 1:].strip().startswith("#")):
+                    raise RuntimeError(f"镜像配置第 {line_number} 行单引号字符串不正确")
+                value = value[1:ending]
+            else:
+                value = re.sub(r"\s+#.*$", "", value).rstrip()
+            values[name] = value_text(name, value)
+    # 所有参数校验完成后一次写入，不能留下只加载了一半的现场配置。
+    for name, value in values.items():
+        target.setdefault(name, value)
+    return True
 
 
 class ConfigManager:
-    """爬虫配置管理类，使用硬编码的站点配置（模板示例）"""
+    """甘肃中医药大学三个归档栏目的配置及兼容访问器。"""
 
     def __init__(self):
-        """初始化配置管理器，使用硬编码配置"""
-        # 新闻采集配置模板 - 请根据目标网站修改
+        base_domain = "https://www.gszy.edu.cn"
         self.categories_config = {
-            "栏目1_标准列表": {
-                "base_url": "***",
-                "base_domain": "***",
-                "items_per_page": 15,
-                "is_active": True,
-                "total_count_xpath": ["//div[@class='pb_sys_common pb_sys_normal pb_sys_style1']/span[2]/text()"],
-                "news_links_xpath": ["//ul[@class='list']//a/@href"],
-                "news_titles_xpath": ["//ul[@class='list']//a/@title"],
-                "title_xpath": ["//h1/text()", "//title/text()"],
-                "date_xpath": ["//div/form/p//text()"],
-                "author_xpath": ["//div/form/p//text()"],
-                "content_xpath": ["//div[@class='v_news_content']//text()"],
-                "image_xpath": ["//div[@class='v_news_content']//img/@src"],
-                "video_xpath": ["//div[@class='v_news_content']//video/source/@src"],
-                "valid_url_patterns": ["***", "https://mp.weixin.qq.com"],
-                "special_handling": {
-                    "metadata_xpath": "//div/form/p"
-                }
+            "学校要闻": {
+                "base_url": f"{base_domain}/reception/news/list/3-10.htm",
+                "list_api": f"{base_domain}/reception/news/list/ajaxNewsList",
+                "detail_api": f"{base_domain}/reception/news/detail/ajaxDetail",
+                "article_url_template": f"{base_domain}/reception/news/detail/{{id}}.htm",
+                "type_param": "newsTypeId", "type_id": "10",
+                "date_field": "release_time", "classification": "WY11", "category_code": "01",
             },
-            "栏目2_标准列表": {
-                "base_url": "***",
-                "base_domain": "***",
-                "items_per_page": 15,
-                "is_active": True,
-                "total_count_xpath": ["//div[@class='pb_sys_common pb_sys_normal pb_sys_style1']/span[2]/text()"],
-                "news_links_xpath": ["//ul[@class='list']//a/@href"],
-                "news_titles_xpath": ["//ul[@class='list']//a/@title"],
-                "title_xpath": ["//h1/text()", "//title/text()"],
-                "date_xpath": ["//div/form/p//text()"],
-                "author_xpath": ["//div/form/p//text()"],
-                "content_xpath": ["//div[@class='v_news_content']//text()"],
-                "image_xpath": ["//div[@class='v_news_content']//img/@src"],
-                "video_xpath": ["//div[@class='v_news_content']//video/source/@src"],
-                "valid_url_patterns": ["***", "https://mp.weixin.qq.com"],
-                "special_handling": {
-                    "metadata_xpath": "//div/form/p"
-                }
+            "杏林动态": {
+                "base_url": f"{base_domain}/reception/news/list/3-1.htm",
+                "list_api": f"{base_domain}/reception/news/list/ajaxNewsList",
+                "detail_api": f"{base_domain}/reception/news/detail/ajaxDetail",
+                "article_url_template": f"{base_domain}/reception/news/detail/{{id}}.htm",
+                "type_param": "newsTypeId", "type_id": "1",
+                "date_field": "release_time", "classification": "WY12", "category_code": "02",
             },
-            "栏目3_多URL源": {
-                "base_url": [
-                    "***",
-                    "***",
-                    "***"
-                ],
-                "base_domain": "***",
-                "items_per_page": 10,
-                "is_active": True,
-                "total_count_xpath": ["//div[@class='pb_sys_common pb_sys_normal pb_sys_style1']/span/text()"],
-                "news_links_xpath": ["//ul[@class='flex']//a/@href"],
-                "news_titles_xpath": ["//ul[@class='flex']//a/@title"],
-                "title_xpath": ["//h1/text()", "//title/text()"],
-                "date_xpath": ["//div/form/p//text()"],
-                "author_xpath": ["//div/form/p//text()"],
-                "content_xpath": ["//div[@class='v_news_content']//text()"],
-                "image_xpath": ["//div[@class='v_news_content']//img/@src"],
-                "video_xpath": ["//div[@class='v_news_content']//video/source/@src"],
-                "valid_url_patterns": ["***", "https://mp.weixin.qq.com"],
-                "special_handling": {
-                    "metadata_xpath": "//div/form/p",
-                    "link_filter_pattern": "***",  # 只保留包含此模式的链接
-                    "multiple_base_urls": True  # 标记为多URL栏目
-                }
+            "通知公告": {
+                "base_url": f"{base_domain}/reception/notice/list/index",
+                "list_api": f"{base_domain}/reception/notice/list/ajaxNoticeList",
+                "detail_api": f"{base_domain}/reception/notice/detail/ajaxDetail",
+                "article_url_template": f"{base_domain}/reception/notice/detail/{{id}}.htm",
+                "type_param": "noticeTypeId", "type_id": "81b537ee8f6c4dc3822efd0ff8c73baf",
+                "date_field": "create_time", "classification": "WY13", "category_code": "03",
             },
-            "栏目4_特殊页面结构": {
-                "base_url": "***",
-                "base_domain": "***",
-                "items_per_page": 15,
-                "is_active": False,  # 默认不启用，使用专用采集器
-                "total_count_xpath": ["//div[@class='pb_sys_common pb_sys_normal pb_sys_style1']/span[2]/text()"],
-                "news_links_xpath": ["//ul[@class='list']//a/@href"],
-                "news_titles_xpath": ["//ul[@class='list']//a/@title"],
-                "title_xpath": ["//h1/text()", "//title/text()"],
-                "date_xpath": ["//div/form/p//text()"],
-                "author_xpath": ["//div/form/p//text()"],
-                "content_xpath": ["//div[@class='v_news_content']//text()"],
-                "image_xpath": ["//div[@class='v_news_content']//img/@src"],
-                "video_xpath": ["//div[@class='v_news_content']//video/source/@src"],
-                "valid_url_patterns": ["***", "https://mp.weixin.qq.com"],
-                "special_handling": {
-                    "metadata_xpath": "//div/form/p",
-                    "use_custom_collector": True,  # 使用专用采集器
-                    "custom_collector": "CustomCollector",  # 专用采集器名称
-                    "sub_sources": {
-                        # 子源A：列表页
-                        "sub_a": {
-                            "urls": [
-                                "***",
-                                "***",
-                                "***",
-                                "***"
-                            ],
-                            "news_links_xpath": "//ul[@class='flex']//a/@href",
-                            "news_titles_xpath": "//ul[@class='flex']//a/@title",
-                            "link_filter_pattern": "***",
-                            "items_per_page": 10
-                        },
-                        # 子源B：单页面（无分页）
-                        "sub_b_single_page": {
-                            "urls": ["***"],
-                            "is_single_page": True,
-                            "title_xpath": "***",
-                            "content_xpath": "***",
-                            "image_xpath": "***",
-                            "no_metadata": True
-                        },
-                        # 子源C：单页面（无分页）
-                        "sub_c_single_page": {
-                            "urls": ["***"],
-                            "is_single_page": True,
-                            "title_xpath": "***",
-                            "content_xpath": "***",
-                            "image_xpath": "***",
-                            "no_metadata": True
-                        },
-                        # 子源D：标准列表页
-                        "sub_d_list": {
-                            "urls": ["***"],
-                            "news_links_xpath": "//ul[@class='list']//a/@href",
-                            "news_titles_xpath": "//ul[@class='list']//a/@title",
-                            "items_per_page": 15
-                        }
-                    }
-                }
-            }
         }
+        for config in self.categories_config.values():
+            config.update({
+                "base_domain": base_domain, "items_per_page": 10, "is_active": True,
+                "valid_url_patterns": [f"{base_domain}/reception/"], "special_handling": {},
+            })
 
-    def get_active_categories(self) -> Dict[str, any]:
-        """
-        获取所有启用的分类及其URL
-        :return: 分类名称到URL的字典（URL可能是字符串或列表）
-        """
-        return {
-            name: config["base_url"]
-            for name, config in self.categories_config.items()
-            if config.get("is_active", True)
-        }
+    def get_active_categories(self) -> Dict[str, Any]:
+        """获取启用栏目的列表页面地址。"""
+        return {name: config["base_url"] for name, config in self.categories_config.items()
+                if config.get("is_active", True)}
 
     def get_category_config(self, category_name: str) -> Optional[Dict[str, Any]]:
-        """
-        获取指定分类的完整配置
-        :param category_name: 分类名称
-        :return: 配置字典或None
-        """
+        """获取指定栏目的完整配置。"""
         return self.categories_config.get(category_name)
 
     def get_xpath_config(self, category_name: str, xpath_type: str) -> List[str]:
-        """
-        获取指定分类的特定xpath配置列表
-        :param category_name: 分类名称
-        :param xpath_type: xpath类型（如：news_links_xpath, news_titles_xpath等）
-        :return: xpath列表
-        """
-        config = self.get_category_config(category_name)
-        if config and config.get(xpath_type):
-            xpath_list = config.get(xpath_type)
-            if isinstance(xpath_list, list):
-                return xpath_list
-            elif isinstance(xpath_list, str):
-                return [xpath_list]
-        return []
+        """保留原有解析模块使用的 XPath 配置访问方式。"""
+        value = (self.get_category_config(category_name) or {}).get(xpath_type)
+        if isinstance(value, str):
+            return [value]
+        return value if isinstance(value, list) else []
 
     def get_content_xpaths(self, category_name: str) -> List[str]:
-        """
-        获取内容xpath列表（按优先级排序）
-        :param category_name: 分类名称
-        :return: xpath列表
-        """
-        config = self.get_category_config(category_name)
-        if config and config.get('content_xpath'):
-            return config['content_xpath']
-        return []
+        """获取正文 XPath 配置。"""
+        return self.get_xpath_config(category_name, "content_xpath")
 
     def get_valid_url_patterns(self, category_name: str) -> List[str]:
-        """
-        获取有效URL模式列表
-        :param category_name: 分类名称
-        :return: URL模式列表
-        """
-        config = self.get_category_config(category_name)
-        if config and config.get('valid_url_patterns'):
-            return config['valid_url_patterns']
-        return []
+        """获取允许的文章地址前缀。"""
+        return (self.get_category_config(category_name) or {}).get("valid_url_patterns", [])
 
     def get_base_domain(self, category_name: str) -> Optional[str]:
-        """
-        获取基础域名
-        :param category_name: 分类名称
-        :return: 基础域名或None
-        """
-        config = self.get_category_config(category_name)
-        if config:
-            return config.get('base_domain')
-        return None
+        """获取栏目所属网站。"""
+        return (self.get_category_config(category_name) or {}).get("base_domain")
 
     def get_items_per_page(self, category_name: str) -> int:
-        """
-        获取每页条数
-        :param category_name: 分类名称
-        :return: 每页条数，默认15
-        """
-        config = self.get_category_config(category_name)
-        if config:
-            return config.get('items_per_page', 15)
-        return 15
+        """获取站点每页条数。"""
+        return (self.get_category_config(category_name) or {}).get("items_per_page", 10)
 
-    def get_special_handling(self, category_name: str) -> Optional[Dict[str, Any]]:
-        """
-        获取特殊处理配置
-        :param category_name: 分类名称
-        :return: 特殊处理配置字典或None
-        """
-        config = self.get_category_config(category_name)
-        if config and config.get('special_handling'):
-            return config.get('special_handling')
-        return {}
+    def get_special_handling(self, category_name: str) -> Dict[str, Any]:
+        """保留原有特殊配置访问方式。"""
+        return (self.get_category_config(category_name) or {}).get("special_handling", {})
 
     def is_special_category(self, category_name: str) -> bool:
-        """
-        检查是否为特殊处理分类
-        :param category_name: 分类名称
-        :return: 是否特殊处理
-        """
-        config = self.get_category_config(category_name)
-        if config and config.get('special_handling'):
-            return config['special_handling'].get('special_xpath', False)
-        return False
+        """检查是否启用特殊 XPath 解析。"""
+        return self.get_special_handling(category_name).get("special_xpath", False)
 
     def should_filter_non_future_net(self, category_name: str) -> bool:
-        """
-        检查是否需要过滤非目标域名的链接（默认不过滤）
-        :param category_name: 分类名称
-        :return: 是否过滤
-        """
+        """兼容旧调用方，地址验证由栏目地址前缀统一完成。"""
         return False
 
     def get_link_filter_pattern(self, category_name: str) -> Optional[str]:
-        """
-        获取链接过滤模式
-        :param category_name: 分类名称
-        :return: 过滤模式字符串或None
-        """
-        special_handling = self.get_special_handling(category_name)
-        if special_handling:
-            return special_handling.get('link_filter_pattern', None)
-        return None
+        """获取兼容的链接过滤配置。"""
+        return self.get_special_handling(category_name).get("link_filter_pattern")
 
     def has_multiple_base_urls(self, category_name: str) -> bool:
-        """
-        检查分类是否有多个base_url
-        :param category_name: 分类名称
-        :return: 是否有多个base_url
-        """
-        special_handling = self.get_special_handling(category_name)
-        if special_handling:
-            return special_handling.get('multiple_base_urls', False)
-        return False
+        """检查是否配置多个列表页面。"""
+        return self.get_special_handling(category_name).get("multiple_base_urls", False)
 
 
-# 全局配置管理器实例
 config_manager = ConfigManager()

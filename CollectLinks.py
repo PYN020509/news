@@ -1,416 +1,273 @@
+import logging
+import os
 import re
 import time
-import os
-import json
+from datetime import date
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import SqlClient  # 恢复数据库连接
-from CollectDetail import Cl  # 重新启用详情采集模块
-from ConfigManager import config_manager  # 导入配置管理器
-from lxml import etree
-import urllib3
-import ssl
 
-# 禁用 SSL 警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from ConfigManager import config_manager
 
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Connection': 'close',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate'
-}
+
+logger = logging.getLogger(__name__)
+
 
 class NewsCollector:
-    def __init__(self):
-        # 创建自定义的SSL适配器
+    """遍历真实列表接口，按发布时间采集三个归档栏目。"""
+
+    def __init__(self, start_date=None, end_date=None, dry_run=False, stop_event=None):
+        self.start_date = self._parse_date(start_date) if start_date is not None else None
+        self.end_date = self._parse_date(end_date) if end_date is not None else None
+        if self.start_date is not None and self.end_date is not None and self.start_date > self.end_date:
+            raise ValueError("采集开始日期不得晚于结束日期")
+        self.dry_run = dry_run
+        self.stop_event = stop_event
+        self.request_interval = float(os.getenv("NEWS_REQUEST_INTERVAL", os.getenv("CRAWL_REQUEST_INTERVAL", "1.0")))
+        if self.request_interval < 0:
+            raise ValueError("请求间隔不得为负数")
         self.session = requests.Session()
-
-        # 配置重试策略
-        retry_strategy = Retry(
-            total=5,  # 最大重试次数
-            backoff_factor=2,  # 重试延迟系数
-            status_forcelist=[429, 500, 502, 503, 504],  # 需要重试的HTTP状态码
-            allowed_methods=["HEAD", "GET", "OPTIONS"]  # 允许重试的方法
-        )
-
-        # 创建适配器
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=20
-        )
-
-        # 将适配器挂载到session
-        self.session.mount("http://", adapter)
+        self.session.verify = os.environ.get("NEWS_VERIFY_TLS", "true").lower() not in ("false", "0", "no")
+        retry = Retry(total=3, backoff_factor=1,
+                      status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
+        adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
-
-        # SSL配置
-        self.session.verify = False  # 禁用 SSL 验证
-        self.session.keep_alive = False
-
-        # 从数据库获取配置，替代硬编码的base_urls
+        self.session.mount("http://", adapter)
+        self.session.headers.update({
+            "User-Agent": "GSZY-ArchiveCollector/1.0", "Accept": "application/json",
+            "Referer": "https://www.gszy.edu.cn/reception/index",
+        })
         self.base_urls = config_manager.get_active_categories()
-        print(f"从数据库加载的活跃分类: {list(self.base_urls.keys())}")
+        self.discovered_articles = []
+        self._seen = set()
+        self.summary = None
+        self._stopped_reason = None
 
-        self.invalid_links_file = "invalid_links.txt"
-        self.collected_news_file = "collected_news.txt"  # 用于保存采集到的新闻
+    @staticmethod
+    def _parse_date(value):
+        """校验日期参数并允许直接传入日期对象。"""
+        if isinstance(value, date):
+            return date(value.year, value.month, value.day)
+        try:
+            return date.fromisoformat(str(value)[:10])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"日期缺失或格式不正确：{value!r}") from exc
 
     def collect_news(self):
-        """采集各个新闻分类"""
-        for category, base_url in self.base_urls.items():
+        """返回可供调用方判断是否完成的统计，失败不会标记为成功。"""
+        self.discovered_articles = []
+        self._seen = set()
+        self._stopped_reason = None
+        self.summary = {
+            "start_date": self.start_date.isoformat() if self.start_date is not None else None,
+            "end_date": self.end_date.isoformat() if self.end_date is not None else None,
+            "dry_run": self.dry_run, "success": False, "matched": 0, "collected": 0,
+            "existing": 0, "failed": 0, "page_failures": 0, "categories": {}, "errors": [],
+        }
+        for category in self.base_urls:
+            stats = {
+                "pages_expected": 0, "pages_processed": 0, "total_reported": 0, "listed": 0,
+                "matched": 0, "collected": 0, "existing": 0, "duplicates": 0,
+                "outside_range": 0, "skipped": 0, "failed": 0, "page_failures": 0,
+            }
+            self.summary["categories"][category] = stats
             try:
-                print(f"开始采集{category}...")
+                if self._stopped_reason:
+                    raise InterruptedError(self._stopped_reason)
+                self._check_running()
+                self._collect_category(category, stats)
+            except InterruptedError as exc:
+                self._stopped_reason = str(exc)
+                self._failure(category, self._stopped_reason, page_failure=True)
+                logger.warning("栏目采集已停止：%s %s", category, exc)
+            except Exception as exc:
+                self._failure(category, str(exc), page_failure=True)
+                logger.exception("栏目采集失败：%s", category)
+            stats["complete"] = (
+                stats["page_failures"] == 0 and stats["failed"] == 0
+                and stats["pages_processed"] == stats["pages_expected"]
+                and stats["listed"] == stats["total_reported"]
+            )
+            logger.info("栏目统计：%s %s", category, stats)
+        for name in ("matched", "collected", "existing", "failed", "page_failures"):
+            self.summary[name] = sum(stats[name] for stats in self.summary["categories"].values())
+        self.summary["success"] = all(stats["complete"] for stats in self.summary["categories"].values())
+        return self.summary
 
-                # 检查是否有多个base_url
-                if isinstance(base_url, list):
-                    # 多个URL的情况（如成信人物）
-                    print(f"{category} 有 {len(base_url)} 个采集源")
-                    for idx, url in enumerate(base_url, 1):
-                        print(f"采集第 {idx}/{len(base_url)} 个源: {url}")
-                        self._collect_category(url, category)
-                else:
-                    # 单个URL的情况
-                    self._collect_category(base_url, category)
-            except Exception as e:
-                print(f"采集{category}出错: {e}")
+    def _post_json(self, url, data):
+        """使用校验证书的 HTTP 请求获取接口数据。"""
+        self._check_running()
+        if self.request_interval:
+            if self.stop_event is not None:
+                if self.stop_event.wait(self.request_interval):
+                    raise InterruptedError("服务已接到停止信号，采集任务保持未完成")
+            else:
+                time.sleep(self.request_interval)
+        response = self.session.post(url, data=data, timeout=(10, 45))
+        response.raise_for_status()
+        return response.json()
 
-    def _safe_get(self, url, max_retries=3):
-        """安全的GET请求，带重试机制"""
-        for attempt in range(max_retries):
+    def _request_page(self, config, page):
+        payload = self._post_json(config["list_api"], {
+            config["type_param"]: config["type_id"], "pageNo": page, "title": "",
+        })
+        if not isinstance(payload, dict) or payload.get("code") != 200:
+            raise ValueError(f"列表接口返回错误：{payload!r}")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise ValueError("列表接口缺少分页数据或文章列表")
+        for key in ("totalRow", "totalPage", "pageNumber", "pageSize"):
+            value = data.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"列表接口分页字段异常：{key}={value!r}")
+        if data["pageNumber"] != page:
+            raise ValueError(f"请求第 {page} 页却返回第 {data['pageNumber']} 页")
+        if data["totalRow"] and (not data["pageSize"] or not data["totalPage"]):
+            raise ValueError("列表接口总数与分页信息不一致")
+        if data["pageSize"]:
+            expected_pages = (data["totalRow"] + data["pageSize"] - 1) // data["pageSize"]
+            if data["totalPage"] != expected_pages:
+                raise ValueError("列表接口总页数与总条数不一致")
+        return data
+
+    def _collect_category(self, category, stats):
+        config = config_manager.get_category_config(category)
+        first_page = self._request_page(config, 1)
+        stats["pages_expected"] = max(first_page["totalPage"], 1)
+        stats["total_reported"] = first_page["totalRow"]
+        logger.info("开始采集 %s，共 %s 页、%s 条，日期 %s 至 %s",
+                    category, stats["pages_expected"], stats["total_reported"],
+                    self.start_date, self.end_date)
+        consecutive_failures = 0
+        for page in range(1, stats["pages_expected"] + 1):
             try:
-                print(f"正在请求: {url} (尝试 {attempt + 1}/{max_retries})")
-                response = self.session.get(
-                    url,
-                    headers=headers,
-                    verify=False,
-                    timeout=(10, 30),  # (连接超时, 读取超时)
-                    allow_redirects=True
+                self._check_running()
+                data = first_page if page == 1 else self._request_page(config, page)
+                if data["totalRow"] != stats["total_reported"] or max(data["totalPage"], 1) != stats["pages_expected"]:
+                    raise ValueError("采集期间列表总数发生变化，请重新运行以保证完整性")
+                expected_count = min(data["pageSize"], max(data["totalRow"] - (page - 1) * data["pageSize"], 0))
+                if len(data["list"]) != expected_count:
+                    raise ValueError(f"第 {page} 页应有 {expected_count} 条，实际 {len(data['list'])} 条")
+                stats["pages_processed"] += 1
+                stats["listed"] += len(data["list"])
+                consecutive_failures = 0
+                # 置顶和编辑后的历史文章可能乱序，必须遍历所有分页。
+                for item in data["list"]:
+                    self._process_news_item(item, category, config, stats)
+                if page == 1 or page % 20 == 0 or page == stats["pages_expected"]:
+                    logger.info("列表进度：%s %s/%s 页，范围内 %s 条", category, page,
+                                stats["pages_expected"], stats["matched"])
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                self._failure(category, str(exc), page=page, page_failure=True)
+                logger.error("列表页采集失败：%s 第 %s 页：%s", category, page, exc)
+                network_failure = (
+                    isinstance(exc, requests.exceptions.RequestException)
+                    and not isinstance(exc, requests.exceptions.JSONDecodeError)
                 )
-                response.raise_for_status()
-                return response
-            except requests.exceptions.SSLError as e:
-                print(f"SSL错误 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    print(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                else:
-                    print(f"多次重试后仍然失败，跳过此URL")
-                    return None
-            except requests.exceptions.ConnectionError as e:
-                print(f"连接错误 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    print(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                else:
-                    return None
-            except requests.exceptions.Timeout as e:
-                print(f"请求超时 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    return None
-            except Exception as e:
-                print(f"请求异常 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    return None
-        return None
+                consecutive_failures = consecutive_failures + 1 if network_failure else 0
+                if consecutive_failures >= 3:
+                    raise RuntimeError("连续三个列表页 HTTP 请求失败，已停止该栏目，请查看失败报告后重试") from exc
+        if stats["listed"] != stats["total_reported"]:
+            self._failure(category, f"列表总数不一致：读取 {stats['listed']} 条，接口报告 {stats['total_reported']} 条", page_failure=True)
 
-    def _collect_category(self, base_url, category):
-        """采集单个新闻分类页面"""
+    def _process_news_item(self, item, category, config, stats):
+        url = ""
         try:
-            response = self._safe_get(base_url)
-            if not response:
-                print(f"无法访问 {category} 页面: {base_url}")
+            self._check_running()
+            if not isinstance(item, dict):
+                raise ValueError("文章列表项必须是对象")
+            article_id = str(item.get("id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", article_id):
+                raise ValueError(f"文章编号异常：{article_id!r}")
+            url = self._resolve_link(config["article_url_template"].format(id=article_id), category)
+            list_date = self._parse_date(item.get(config["date_field"]) or "")
+            key = (category, url)
+            if key in self._seen:
+                stats["duplicates"] += 1
+                # 重复的分页项可能意味着接口翻页偏移，不能据此确认已完整采集。
+                raise ValueError("同一栏目分页出现重复文章，请重新核对列表完整性")
+            self._seen.add(key)
+            if ((self.start_date is not None and list_date < self.start_date)
+                    or (self.end_date is not None and list_date > self.end_date)):
+                stats["outside_range"] += 1
                 return
-
-            response.encoding = response.apparent_encoding  # 自动检测编码
-            html = etree.HTML(response.text)
-
-            # 获取总页数 - 使用数据库配置
-            total_pages = 1  # 默认总页数为1
-
-            # 从数据库获取总条数xpath配置
-            total_count_xpaths = config_manager.get_xpath_config(category, 'total_count_xpath')
-            if total_count_xpaths:
-                p_t_span = None
-                for xpath in total_count_xpaths:
-                    p_t_span = html.xpath(xpath)
-                    if p_t_span:
-                        print(f"使用xpath '{xpath}' 成功获取总条数")
-                        break
-
-                if p_t_span:
-                    p_t_text = p_t_span[0]  # 获取第一个匹配的文本
-                    print(f"获取到总条数信息: {p_t_text}")
-
-                    # 提取数字
-                    numbers = re.findall(r'\d+', p_t_text)
-                    if numbers:
-                        total_count = int(numbers[0])  # 获取第一个数字，如87
-                        print(f"总条数: {total_count}")
-
-                        # 从数据库获取每页条数配置
-                        items_per_page = config_manager.get_items_per_page(category)
-                        total_pages = (total_count + items_per_page - 1) // items_per_page  # 向上取整
-                        print(f"{category} - 每页{items_per_page}条，计算总页数: {total_pages}")
-                else:
-                    print(f"所有总条数xpath都未获取到结果: {total_count_xpaths}")
-            else:
-                print(f"未找到分类 '{category}' 的总条数xpath配置，使用默认页数1")
-
-            print(f"总页数: {total_pages}")
-
-            # 遍历所有页面，从第一页到最后一页
-            for page in range(1, total_pages + 1):
-                page_url = self._get_page_url(base_url, page, total_pages)
-                print(f"采集第 {page} 页: {page_url}")
-                self._collect_page(page_url, category)
-                time.sleep(1)  # 延时避免过快请求
-
-        except Exception as e:
-            print(f"获取分类页面错误: {e}")
-
-    def _get_page_url(self, base_url, page, total_pages):
-        """根据页面号构建页面 URL - 成信大学使用倒序分页"""
-        if page == 1:
-            return base_url  # 第1页使用基准URL
-        else:
-            # 成信大学的分页URL格式是倒序的：
-            # 第1页 = cxyw.htm
-            # 第2页 = cxyw/195.htm (total_pages - 1)
-            # 第3页 = cxyw/194.htm (total_pages - 2)
-            # ...
-            # 最后一页 = cxyw/1.htm
-            # 例如：总条数2926，每页15条，总页数196
-            # 第2页应该是 cxyw/195.htm
-            if base_url.endswith('.htm'):
-                base_part = base_url[:-4]  # 去掉 .htm
-                reverse_page = total_pages - page + 1  # 计算倒序页码
-                return f"{base_part}/{reverse_page}.htm"
-            else:
-                # 如果不是.htm结尾，使用参数方式
-                if '?' in base_url:
-                    return f"{base_url}&page={page}"
-                else:
-                    return f"{base_url}?page={page}"
-
-    def _collect_page(self, page_url, category):
-        """采集单个页面的新闻"""
-        try:
-            page_response = self._safe_get(page_url)
-            if not page_response:
-                print(f"无法访问页面: {page_url}")
+            stats["matched"] += 1
+            self.discovered_articles.append({
+                "category": category, "classification": config["classification"],
+                "url": url, "date": list_date.isoformat(), "title": item.get("title") or "",
+                "article_data": item,
+            })
+            if self.dry_run:
                 return
-
-            page_response.encoding = page_response.apparent_encoding  # 自动检测编码
-            page_html = etree.HTML(page_response.text)
-
-            # 获取新闻链接和标题 - 使用数据库配置
-            # 从数据库获取xpath配置
-            news_links_xpaths = config_manager.get_xpath_config(category, 'news_links_xpath')
-            news_titles_xpaths = config_manager.get_xpath_config(category, 'news_titles_xpath')
-
-            if not news_links_xpaths or not news_titles_xpaths:
-                print(f"分类 '{category}' 缺少必要的xpath配置")
+            from SqlClient import Cs
+            if Cs.check_url_exists(url, category=category):
+                stats["existing"] += 1
                 return
-
-            print(f"正在处理{category}页面: {page_url}")
-            print(f"使用链接xpath: {news_links_xpaths}")
-            print(f"使用标题xpath: {news_titles_xpaths}")
-
-            # 尝试获取新闻链接
-            news_links = []
-            for xpath in news_links_xpaths:
-                news_links = page_html.xpath(xpath)
-                if news_links:
-                    print(f"使用链接xpath '{xpath}' 成功获取到 {len(news_links)} 条链接")
-                    break
-
-            # 尝试获取新闻标题
-            news_titles = []
-            for xpath in news_titles_xpaths:
-                news_titles = page_html.xpath(xpath)
-                if news_titles:
-                    print(f"使用标题xpath '{xpath}' 成功获取到 {len(news_titles)} 个标题")
-                    break
-
-            print(f"{category}页面 - 找到 {len(news_links)} 条新闻链接，{len(news_titles)} 个标题")
-
-            # 检查是否为特殊处理分类（如学术报告）
-            if config_manager.is_special_category(category):
-                # 特殊分类处理逻辑 - 直接使用获取到的链接和标题
-                for i in range(min(len(news_links), len(news_titles))):
-                    link = news_links[i]
-                    title = news_titles[i].strip() if news_titles[i] else '无标题'
-                    if link:
-                        self._process_news_item(link, title, category)
-                    else:
-                        print(f"未找到链接，标题: {title}")
+            self._check_running()
+            from CollectDetail import Cl
+            result = Cl.Collect_dea(
+                url, category, list_title=item.get("title"),
+                list_date=list_date.isoformat(), article_data=item,
+                start_date=self.start_date.isoformat() if self.start_date is not None else None,
+                end_date=self.end_date.isoformat() if self.end_date is not None else None,
+            )
+            if not isinstance(result, dict) or result.get("success") is False:
+                raise ValueError("详情或附件采集、数据库入库未成功")
+            if result.get("skipped"):
+                stats["skipped"] += 1
             else:
-                # 通用分类处理逻辑
-                if news_links and news_titles:
-                    # 如果成功获取到链接和标题，直接使用
-                    for i in range(min(len(news_links), len(news_titles))):
-                        link = news_links[i]
-                        title = news_titles[i].strip() if news_titles[i] else '无标题'
-                        if link:
-                            self._process_news_item(link, title, category)
-                        else:
-                            print(f"未找到链接，标题: {title}")
-                else:
-                    # 后备方案：使用通用xpath
-                    news_items = page_html.xpath("//ul[@class='ej_list']//a")
-                    print(f"后备方案 - 找到 {len(news_items)} 条新闻")
+                stats["collected"] += 1
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            self._failure(category, str(exc), url=url)
+            logger.error("文章采集失败：%s %s：%s", category, url, exc)
 
-                    for item in news_items:
-                        link = item.get('href')
-                        title = item.text
+    def _check_running(self):
+        """在分页和文章边界响应停止信号，不将未完任务标记为成功。"""
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError("服务已接到停止信号，采集任务保持未完成")
 
-                        title = title.strip() if title else '无标题'
-                        if link:
-                            self._process_news_item(link, title, category)
-                        else:
-                            print(f"未找到链接，标题: {title}")
-
-        except Exception as e:
-            print(f"页面采集错误: {e}")
-            print(f"页面URL: {page_url}")
-
-    def _process_news_item(self, link, title, category):
-        """处理单条新闻项"""
-        try:
-            # 处理相对路径
-            original_link = link
-
-            # 检查链接过滤模式（在解析相对路径之前）
-            link_filter_pattern = config_manager.get_link_filter_pattern(category)
-            if link_filter_pattern:
-                # 如果配置了链接过滤模式，只保留包含该模式的链接
-                if link_filter_pattern not in original_link:
-                    print(f"  过滤链接（不匹配模式 '{link_filter_pattern}'）: {original_link}")
-                    return
-
-            link = self._resolve_link(link, category)
-            print(f"处理新闻 [{category}]: {title}")
-            print(f"  原始链接: {original_link}")
-            print(f"  处理后链接: {link}")
-
-            # 检查链接是否符合要求 - 使用数据库配置
-            print(f"  检查链接有效性...")
-
-            # 获取有效URL模式
-            valid_patterns = config_manager.get_valid_url_patterns(category)
-
-            # 检查特殊处理规则
-            if config_manager.should_filter_non_future_net(category):
-                # 媒体西油等需要过滤非未来网链接的分类
-                if not any(link.startswith(pattern) for pattern in valid_patterns):
-                    self._record_invalid_link(link)
-                    print(f"  {category}栏目过滤链接: {link}, 已记录")
-                    return
-                else:
-                    print(f"  {category}链接有效: {link}")
-            else:
-                # 其他栏目检查是否为有效域名
-                if valid_patterns and not any(link.startswith(pattern) for pattern in valid_patterns):
-                    self._record_invalid_link(link)
-                    print(f"  无效链接: {link}, 已记录")
-                    return
-                else:
-                    print(f"  {category}链接有效: {link}")
-
-            # 检查数据库中是否已存在该URL（通过URL判断是否采集过）
-            if not SqlClient.Cs.check_url_exists(link):
-                print(f"采集新闻: {link}")
-                # 启用详情采集并存储到数据库，传递列表页的标题
-                Cl.Collect_dea(link, category, list_title=title)
-            else:
-                print(f"新闻已存在: {link}")
-
-        except Exception as e:
-            print(f"处理新闻项时出错: {e}")
+    def _failure(self, category, reason, page=None, url=None, page_failure=False):
+        """汇总失败原因，供补采和任务完成判断使用。"""
+        stats = self.summary["categories"][category]
+        stats["page_failures" if page_failure else "failed"] += 1
+        self.summary["errors"].append({
+            "category": category, "page": page, "url": url, "reason": reason,
+        })
 
     def _resolve_link(self, link, category=None):
-        """处理链接为绝对路径 - 使用配置"""
-        if not link.startswith('http'):
-            # 从配置获取基础域名
-            base_domain = config_manager.get_base_domain(category)
-            if not base_domain:
-                # 如果没有配置，使用默认域名
-                base_domain = 'https://www.cuit.edu.cn'
-                print(f"警告: 分类 '{category}' 没有配置基础域名，使用默认域名: {base_domain}")
+        """规范站内文章地址，校验来源并去掉片段。"""
+        base = config_manager.get_base_domain(category)
+        if not base:
+            raise ValueError(f"未配置栏目网站：{category}")
+        absolute = urlsplit(urljoin(base + "/", link.strip()))
+        expected = urlsplit(base)
+        if absolute.scheme not in ("http", "https") or absolute.hostname != expected.hostname:
+            raise ValueError(f"文章地址不属于目标网站：{link}")
+        if absolute.port not in (None, 80, 443) or absolute.username or absolute.password:
+            raise ValueError(f"文章地址包含非标准端口或身份信息：{link}")
+        path = re.sub(r"/{2,}", "/", absolute.path)
+        canonical = urlunsplit(("https", expected.netloc, path, absolute.query, ""))
+        patterns = config_manager.get_valid_url_patterns(category)
+        if patterns and not any(canonical.startswith(pattern) for pattern in patterns):
+            raise ValueError(f"文章地址不属于允许的栏目路径：{canonical}")
+        return canonical
 
-            if link.startswith('/'):
-                # 根据不同的基准 URL 处理相对路径
-                link = base_domain + link
-            elif link.startswith('../'):
-                link = base_domain + '/' + link.lstrip('../')
-            else:
-                # 处理相对路径，如 info/1002/19989.htm
-                link = base_domain + '/' + link
-        return link
+    def close(self):
+        """释放 HTTP 连接池。"""
+        self.session.close()
 
-    def _record_invalid_link(self, link, title="", reason="有反爬机制"):
-        """记录无效链接到文件和数据库"""
-        try:
-            # 记录到文件（保持原有功能）
-            with open(self.invalid_links_file, "a", encoding="utf-8") as f:
-                f.write(link + "\n")
-
-            # 记录到数据库（ID由数据库自动生成）
-            # 创建基本的字典信息
-            invalid_dict = {
-                "网站名称": "成都信息工程大学",
-                "网站域名": link,
-                "所属栏目": "无效链接",
-                "标题": title if title else "无法获取标题",
-                "发布时间": "",
-                "作者": "",
-                "具体新闻内容": [],
-                "采集人": "档案馆",
-                "无效原因": reason
-            }
-
-            # 插入数据库，标记为无效链接
-            # 注意：is_valid_link有值时，record_id会自动设置为-1
-            # 检查URL是否已存在，避免重复插入
-            if not SqlClient.Cs.check_url_exists(link):
-                sql = SqlClient.Cs.ins(
-                    title=title if title else "无法获取标题",
-                    url=link,
-                    dict_=json.dumps(invalid_dict, ensure_ascii=False),
-                    image_path_list=[],
-                    video_path_list=[],
-                    pdf_list=[],
-                    info="{}",
-                    is_valid_link=reason  # 标记为无效链接，record_id会自动设为-1
-                )
-                if sql:
-                    print(f"无效链接已记录到数据库: {link}")
-            else:
-                print(f"无效链接已存在于数据库中，跳过插入: {link}")
-
-        except Exception as e:
-            print(f"记录无效链接时出错: {e}")
-
-
-
-    def _save_news(self, title, link):
-        """保存新闻标题和链接到文件"""
-        try:
-            with open(self.collected_news_file, "a", encoding="utf-8") as f:
-                f.write(f"{title} - {link}\n")
-        except Exception as e:
-            print(f"保存新闻时出错: {e}")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     collector = NewsCollector()
-    collector.collect_news()
-
+    try:
+        result = collector.collect_news()
+        raise SystemExit(0 if result["success"] else 1)
+    finally:
+        collector.close()

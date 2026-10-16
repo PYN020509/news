@@ -1,0 +1,6 @@
+# 构建上下文只包含固定依赖、正式程序和本次封装的专用配置。
+*
+!Dockerfile
+!requirements.txt
+!news-*.pyz
+!news.json

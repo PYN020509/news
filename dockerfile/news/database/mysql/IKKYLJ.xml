@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   logicalFilePath="sql/mysql/2026/IKKYLJ.xml"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.5.xsd">
+    <changeSet id="IKKYLJ_1" author="PYN">
+        <preConditions onFail="HALT" onError="HALT" onFailMessage="新闻网专用模板存在重复或不兼容配置，请检查现场数据；禁止覆盖历史模板。">
+            <tableExists tableName="t_biz_access_template"/>
+            <tableExists tableName="t_biz_access_field"/>
+            <sqlCheck expectedResult="0">
+                SELECT CASE WHEN COUNT(*) &gt; 1 THEN 1 ELSE 0 END
+                FROM `t_biz_access_template` WHERE `template_name` = 'IKKYLJ_甘肃中医药新闻网'
+            </sqlCheck>
+            <sqlCheck expectedResult="0">
+                SELECT COUNT(*) FROM `t_biz_access_template`
+                WHERE `template_name` = 'IKKYLJ_甘肃中医药新闻网'
+                  AND COALESCE(NULLIF(`remark`, ''), '__NULL__') &lt;&gt; 'IKKYLJ：甘肃中医药大学新闻网专用字段映射，不修改其他模板'
+            </sqlCheck>
+            <sqlCheck expectedResult="0">
+                SELECT COUNT(*) FROM (
+                    SELECT f.`field_name`
+                    FROM `t_biz_access_field` f
+                    JOIN `t_biz_access_template` t ON t.`id` = f.`template_id`
+                    WHERE t.`template_name` = 'IKKYLJ_甘肃中医药新闻网'
+                    GROUP BY f.`template_id`, f.`field_name`
+                    HAVING COUNT(*) &gt; 1
+                ) duplicate_fields
+            </sqlCheck>
+            <sqlCheck expectedResult="0">
+                SELECT COUNT(*)
+                FROM `t_biz_access_field` f
+                JOIN `t_biz_access_template` t ON t.`id` = f.`template_id`
+                LEFT JOIN (
+                SELECT 'WZMC' AS `field_name`, '网站名称' AS `field_c_name`, '网站名称' AS `access_field_name`, NULL AS `convert_type`, NULL AS `convert_value`, 1 AS `orderd`, 0 AS `is_order_field`, 0 AS `order_type`
+                UNION ALL SELECT 'WZYM', '网站域名', '网站域名', NULL, NULL, 2, 0, 0
+                UNION ALL SELECT 'SSLM', '所属栏目', '所属栏目', NULL, NULL, 3, 0, 0
+                UNION ALL SELECT 'ZTM', '标题', '标题', NULL, NULL, 4, 0, 0
+                UNION ALL SELECT 'WZ', '网址', '网址', NULL, NULL, 5, 0, 0
+                UNION ALL SELECT 'ZRBJ', '编辑', '编辑', NULL, NULL, 6, 0, 0
+                UNION ALL SELECT 'FBSJ', '发布时间', '发布时间', NULL, NULL, 7, 1, 0
+                UNION ALL SELECT 'ZZ', '作者', '作者', NULL, NULL, 8, 0, 0
+                UNION ALL SELECT 'ZY', '摘要', '摘要', NULL, NULL, 9, 0, 0
+                UNION ALL SELECT 'JTXWNR', '具体新闻内容', '具体新闻内容', NULL, NULL, 10, 0, 0
+                UNION ALL SELECT 'CJSJ', '采集时间', '采集时间', NULL, NULL, 11, 0, 0
+                UNION ALL SELECT 'CJR', '采集人', '采集人', 'fixed', '档案馆', 12, 0, 0
+                UNION ALL SELECT 'LAIY', '来源', '来源', NULL, NULL, 13, 0, 0
+                UNION ALL SELECT 'ND', '年度', '年度', NULL, NULL, 14, 0, 0
+                UNION ALL SELECT 'SSLMBH', '所属栏目编号', '所属栏目编号', NULL, NULL, 15, 0, 0
+                UNION ALL SELECT 'FLH', '分类号', '分类号', NULL, NULL, 16, 0, 0
+                ) e ON e.`field_name` = f.`field_name`
+                WHERE t.`template_name` = 'IKKYLJ_甘肃中医药新闻网'
+                  AND (e.`field_name` IS NULL
+                    OR COALESCE(NULLIF(f.`field_c_name`, ''), '__NULL__') &lt;&gt; e.`field_c_name`
+                    OR COALESCE(NULLIF(f.`access_field_name`, ''), '__NULL__') &lt;&gt; e.`access_field_name`
+                    OR COALESCE(NULLIF(f.`access_field_c_name`, ''), '__NULL__') &lt;&gt; e.`field_c_name`
+                    OR COALESCE(NULLIF(f.`convert_type`, ''), '__NULL__') &lt;&gt; COALESCE(NULLIF(e.`convert_type`, ''), '__NULL__')
+                    OR COALESCE(NULLIF(f.`convert_value`, ''), '__NULL__') &lt;&gt; COALESCE(NULLIF(e.`convert_value`, ''), '__NULL__'))
+            </sqlCheck>
+        </preConditions>
+        <comment>初始化三个归档栏目的独立字段模板，分类号直接传入 WY11、WY12、WY13，保留既有模板与迁移历史。</comment>
+        <sql>
+            -- 不绑定现场库、标签或全宗编号，正式业务接口在部署时完成建库建表及授权。
+            INSERT INTO `t_biz_access_template` (`template_name`, `remark`, `create_time`)
+            SELECT 'IKKYLJ_甘肃中医药新闻网', 'IKKYLJ：甘肃中医药大学新闻网专用字段映射，不修改其他模板', CURRENT_TIMESTAMP
+            WHERE NOT EXISTS (
+                SELECT 1 FROM `t_biz_access_template` WHERE `template_name` = 'IKKYLJ_甘肃中医药新闻网'
+            );
+
+            -- 空转换类型沿用系统直接映射语义，禁止写入未支持的转换名称。
+            INSERT INTO `t_biz_access_field` (
+                `template_id`, `field_name`, `field_c_name`,
+                `access_field_name`, `access_field_c_name`,
+                `convert_type`, `convert_value`, `orderd`,
+                `is_order_field`, `order_type`, `remark`, `create_time`
+            )
+            SELECT t.`id`, e.`field_name`, e.`field_c_name`,
+                   e.`access_field_name`, e.`field_c_name`,
+                   e.`convert_type`, e.`convert_value`, e.`orderd`,
+                   e.`is_order_field`, e.`order_type`, 'IKKYLJ 新闻网专用映射', CURRENT_TIMESTAMP
+            FROM `t_biz_access_template` t
+            CROSS JOIN (
+                SELECT 'WZMC' AS `field_name`, '网站名称' AS `field_c_name`, '网站名称' AS `access_field_name`, NULL AS `convert_type`, NULL AS `convert_value`, 1 AS `orderd`, 0 AS `is_order_field`, 0 AS `order_type`
+                UNION ALL SELECT 'WZYM', '网站域名', '网站域名', NULL, NULL, 2, 0, 0
+                UNION ALL SELECT 'SSLM', '所属栏目', '所属栏目', NULL, NULL, 3, 0, 0
+                UNION ALL SELECT 'ZTM', '标题', '标题', NULL, NULL, 4, 0, 0
+                UNION ALL SELECT 'WZ', '网址', '网址', NULL, NULL, 5, 0, 0
+                UNION ALL SELECT 'ZRBJ', '编辑', '编辑', NULL, NULL, 6, 0, 0
+                UNION ALL SELECT 'FBSJ', '发布时间', '发布时间', NULL, NULL, 7, 1, 0
+                UNION ALL SELECT 'ZZ', '作者', '作者', NULL, NULL, 8, 0, 0
+                UNION ALL SELECT 'ZY', '摘要', '摘要', NULL, NULL, 9, 0, 0
+                UNION ALL SELECT 'JTXWNR', '具体新闻内容', '具体新闻内容', NULL, NULL, 10, 0, 0
+                UNION ALL SELECT 'CJSJ', '采集时间', '采集时间', NULL, NULL, 11, 0, 0
+                UNION ALL SELECT 'CJR', '采集人', '采集人', 'fixed', '档案馆', 12, 0, 0
+                UNION ALL SELECT 'LAIY', '来源', '来源', NULL, NULL, 13, 0, 0
+                UNION ALL SELECT 'ND', '年度', '年度', NULL, NULL, 14, 0, 0
+                UNION ALL SELECT 'SSLMBH', '所属栏目编号', '所属栏目编号', NULL, NULL, 15, 0, 0
+                UNION ALL SELECT 'FLH', '分类号', '分类号', NULL, NULL, 16, 0, 0
+            ) e
+            LEFT JOIN `t_biz_access_field` f ON f.`template_id` = t.`id`
+                AND f.`field_name` = e.`field_name`
+            WHERE t.`template_name` = 'IKKYLJ_甘肃中医药新闻网' AND f.`id` IS NULL;
+        </sql>
+    </changeSet>
+</databaseChangeLog>

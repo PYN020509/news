@@ -1,0 +1,19 @@
+# 现场凭据和配置
+.env
+*.env
+!*.env.example
+# 封装时生成的现场专用配置，不进入版本控制。
+dockerfile/news/news.json
+# 程序制品、缓存及采集结果
+dist/
+__pycache__/
+*.pyc
+*.part
+*.log
+logs/
+data/
+state/
+pdf_output/
+.venv/
+invalid_links.txt
+collected_news.txt

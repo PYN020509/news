@@ -1,0 +1,10 @@
+# 仅供联网准备机显式合并使用，现场离线部署不得加载此文件。
+services:
+  news:
+    build:
+      context: ./dockerfile/news
+      dockerfile: Dockerfile
+      args:
+        NEWS_VERSION: ${NEWS_VERSION:?请先配置制品版本}
+        NEWS_ARTIFACT_SHA256: ${NEWS_ARTIFACT_SHA256:?请先配置制品校验值}
+        NEWS_SOURCE_SHA256: ${NEWS_SOURCE_SHA256:?请先配置源码校验值}

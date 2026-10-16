@@ -180,6 +180,7 @@ class ImprovedPDFGenerator:
 
             # 检查是否为微信公众号，决定使用哪种配置
             is_wechat = self.is_wechat_url(url)
+            is_gszy = urlparse(url).hostname == 'www.gszy.edu.cn'
 
             if is_wechat:
                 self.logger.info(f"开始生成微信公众号PDF: {url} -> {filepath}")
@@ -254,6 +255,37 @@ class ImprovedPDFGenerator:
                             # 如果网络空闲等待失败，简单等待3秒
                             await page.wait_for_timeout(3000)
 
+                        if is_gszy:
+                            # 正文通过异步接口加载，必须确认文章标题已渲染，不能保存空页面。
+                            await page.wait_for_function(r"""
+                                expected => {
+                                    const normalize = text => (text || '').replace(/\s+/g, '').trim();
+                                    return Array.from(document.querySelectorAll('.news-title, h1, h2'))
+                                        .some(node => normalize(node.innerText) === normalize(expected));
+                                }
+                            """, arg=title, timeout=timeout)
+                            # 站点正文仍有 HTTP 图片地址，统一为本站 HTTPS 后等待资源加载。
+                            await page.evaluate(r"""
+                                () => document.querySelectorAll('img').forEach(image => {
+                                    const source = image.getAttribute('data-src') || image.getAttribute('src');
+                                    if (!source) return;
+                                    const address = new URL(source, location.href);
+                                    if (address.hostname === 'www.gszy.edu.cn') {
+                                        address.protocol = 'https:';
+                                        address.pathname = address.pathname.replace(/\/{2,}/g, '/');
+                                    }
+                                    image.src = address.href;
+                                })
+                            """)
+                            await self.wait_for_images_to_load(page, 30000)
+                            missing_images = await page.evaluate("""
+                                () => Array.from((document.querySelector('#news_content') || document.body)
+                                    .querySelectorAll('img')).filter(image =>
+                                        !image.complete || image.naturalWidth === 0).length
+                            """)
+                            if missing_images:
+                                raise RuntimeError(f"文章 PDF 尚有 {missing_images} 张图片未加载")
+
                     # 生成PDF - 统一的PDF配置
                     self.logger.info(f"开始生成PDF: {filepath}")
 
@@ -262,7 +294,7 @@ class ImprovedPDFGenerator:
 
                     # 统一的PDF选项（兼容原先ToPDF）
                     await page.pdf(
-                        path=filepath,
+                        path=filepath + '.part',
                         format='A2',
                         print_background=True,
                         prefer_css_page_size=True,
@@ -274,6 +306,12 @@ class ImprovedPDFGenerator:
                         },
                         display_header_footer=False
                     )
+
+                    # PDF 完成后再原子替换，避免中断时覆盖此前有效文件。
+                    with open(filepath + '.part', 'rb') as pdf_file:
+                        if pdf_file.read(5) != b'%PDF-':
+                            raise RuntimeError('生成结果不是有效 PDF 文件')
+                    os.replace(filepath + '.part', filepath)
 
                     success_msg = f"{'微信公众号' if is_wechat else '标准'}PDF生成成功: {filepath}"
                     self.logger.info(success_msg)

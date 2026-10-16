@@ -1,0 +1,35 @@
+services:
+  news:
+    # 联网准备时替换版本与共享目录；现场只使用已导入的正式镜像。
+    image: news-runtime:__BUILD_VERSION__
+    platform: linux/amd64
+    container_name: news-__BUILD_VERSION__
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    # 业务代码、运行账户和现场配置由镜像提供，采集时间由电子档案任务控制。
+    volumes:
+      - type: bind
+        source: __HOST_ARCHIVE_DIRECTORY__
+        target: __CONTAINER_ARCHIVE_DIRECTORY__
+      - type: volume
+        source: news_state
+        target: /var/lib/news/state
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    shm_size: 1gb
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  # 使用项目级持久卷，镜像升级或容器重建时保留任务记录。
+  news_state:
