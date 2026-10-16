@@ -1,17 +1,24 @@
 services:
   news:
-    # 联网准备时替换版本与共享目录；现场只使用已导入的正式镜像。
+    # 联网准备时替换正式版本；共享目录读取现场 .env。
     image: news-runtime:__BUILD_VERSION__
     platform: linux/amd64
     container_name: news-__BUILD_VERSION__
+    user: ${NEWS_RUN_UID:-10001}:${NEWS_RUN_GID:-10001}
+    # PDF 日志与临时工作文件使用共享目录，兼容只读根文件系统。
+    working_dir: ${NEWS_DATA_DIR:?请先填写容器归档目录}
     network_mode: host
     restart: unless-stopped
     init: true
-    # 业务代码、运行账户和现场配置由镜像提供，采集时间由电子档案任务控制。
+    # 业务程序由镜像提供，现场配置只读挂载，采集时间由电子档案任务控制。
     volumes:
       - type: bind
-        source: __HOST_ARCHIVE_DIRECTORY__
-        target: __CONTAINER_ARCHIVE_DIRECTORY__
+        source: ./.env
+        target: /app/config/news.env
+        read_only: true
+      - type: bind
+        source: ${NEWS_HOST_DATA_DIR:?请先填写宿主机归档目录}
+        target: ${NEWS_DATA_DIR:?请先填写容器归档目录}
       - type: volume
         source: news_state
         target: /var/lib/news/state

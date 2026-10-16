@@ -40,20 +40,19 @@ ARG PLAYWRIGHT_DOWNLOAD_HOST
 RUN PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST:-}" \
     python -m playwright install --only-shell chromium
 
-# 将程序和配置放在依赖层之后，更新时复用已核验的固定运行依赖。
+# 将程序放在依赖层之后，更新时复用已核验的固定运行依赖。
 ARG NEWS_VERSION
 ARG NEWS_ARTIFACT_SHA256
 ARG NEWS_SOURCE_SHA256
 ARG NEWS_RUN_UID=10001
 ARG NEWS_RUN_GID=10001
 
-# 现场专用配置只在封装时提供，不写入通用业务源码或 Git。
+# 现场配置由 Compose 只读挂载，不进入镜像或构建上下文。
 COPY --chown=${NEWS_RUN_UID}:${NEWS_RUN_GID} --chmod=0444 news-${NEWS_VERSION}.pyz /app/news.pyz
-COPY --chown=${NEWS_RUN_UID}:${NEWS_RUN_GID} --chmod=0400 news.json /app/config/news.json
 RUN chown "${NEWS_RUN_UID}:${NEWS_RUN_GID}" /home/news /var/lib/news/data /var/lib/news/state \
     && chmod 0750 /var/lib/news/state
 
-ENV NEWS_CONFIG_FILE=/app/config/news.json \
+ENV NEWS_CONFIG_FILE=/app/config/news.env \
     NEWS_VERSION=${NEWS_VERSION} \
     NEWS_ARTIFACT_SHA256=${NEWS_ARTIFACT_SHA256} \
     NEWS_SOURCE_SHA256=${NEWS_SOURCE_SHA256}

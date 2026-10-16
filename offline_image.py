@@ -120,13 +120,14 @@ def read_release(root):
                     raise ValueError("制品内业务源码校验失败：" + name)
             elif name == "requirements.txt":
                 content = checked_path(root, "dockerfile/news/requirements.txt").read_bytes()
-            elif name == "docker-compose.yml" and configuration is not None:
+            elif name == "docker-compose.yml":
                 content = checked_path(root, name).read_bytes().decode("utf-8")
-                for key, field, placeholder in (("NEWS_HOST_DATA_DIR", "source", "__HOST_ARCHIVE_DIRECTORY__"),
-                                                ("NEWS_DATA_DIR", "target", "__CONTAINER_ARCHIVE_DIRECTORY__")):
-                    value = json.dumps(configuration[key], ensure_ascii=False)
-                    content = re.sub(r"(?m)^([ \t]*" + field + r":[ \t]*)" + re.escape(value) + r"(?=\r?$)",
-                                     lambda match: match[1] + placeholder, content)
+                if configuration is not None:
+                    for key, field, placeholder in (("NEWS_HOST_DATA_DIR", "source", "__HOST_ARCHIVE_DIRECTORY__"),
+                                                    ("NEWS_DATA_DIR", "target", "__CONTAINER_ARCHIVE_DIRECTORY__")):
+                        value = json.dumps(configuration[key], ensure_ascii=False)
+                        content = re.sub(r"(?m)^([ \t]*" + field + r":[ \t]*)" + re.escape(value) + r"(?=\r?$)",
+                                         lambda match: match[1] + placeholder, content)
                 content = content.replace(version, "__BUILD_VERSION__").encode("utf-8")
             elif name == "dockerfile/news/news.env.example":
                 content = checked_path(root, name).read_bytes().decode("utf-8")
@@ -148,6 +149,12 @@ def read_release(root):
             fingerprint.update(name.encode("utf-8") + b"\0" + content + b"\0")
         if fingerprint.hexdigest() != manifest["source_sha256"]:
             raise ValueError("实际构建输入与源码身份不一致")
+    if manifest.get("external_configuration"):
+        if manifest.get("embedded_configuration"):
+            raise ValueError("现场配置不能同时标记为外置和镜像内置")
+        if checked_path(root, ".env.example").read_bytes() != checked_path(
+                root, "dockerfile/news/news.env.example").read_bytes():
+            raise ValueError("交付根目录的现场配置模板与模块模板不一致")
     return manifest, artifact
 
 
@@ -313,7 +320,7 @@ def verify(root, loaded=False):
     for name in ("version", "artifact_filename", "artifact_sha256", "source_sha256"):
         if offline[name] != manifest[name]:
             raise ValueError("离线清单与构建清单不一致：" + name)
-    for name in ("embedded_configuration", "configuration_sha256"):
+    for name in ("embedded_configuration", "external_configuration", "configuration_sha256"):
         if offline.get(name) != manifest.get(name):
             raise ValueError("离线清单与构建配置身份不一致：" + name)
     if offline["platform"] != PLATFORM or offline["image"] != "news-runtime:" + manifest["version"]:
@@ -329,6 +336,8 @@ def verify(root, loaded=False):
         raise ValueError("构建镜像 ID 未连接到归档中的已验证配置")
     required = {"BUILD-MANIFEST.json", "OFFLINE-MANIFEST.json", offline["image_tar"],
                 "dockerfile/news/" + manifest["artifact_filename"], "offline_image.py", "build_artifact.py"}
+    if manifest.get("external_configuration"):
+        required.add(".env.example")
     if not required.issubset(listed):
         raise ValueError("SHA256SUMS 缺少必要交付文件")
     if loaded:
@@ -342,8 +351,11 @@ def test_runtime(manifest, artifact):
     common = ["run", "--rm", "--pull", "never", "--network", "none", "--read-only",
               "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m"]
     program = common[:]
-    if not manifest.get("embedded_configuration"):
+    if not manifest.get("embedded_configuration") and not manifest.get("external_configuration"):
         program += ["--mount", "type=bind,source=" + str(artifact) + ",target=/app/news.pyz,readonly"]
+    # 帮助检查不依赖尚未填写的现场配置，也不会启动采集或访问数据库。
+    if manifest.get("external_configuration"):
+        program += ["-e", "NEWS_CONFIG_FILE="]
     for name, value in (("NEWS_VERSION", manifest["version"]),
                         ("NEWS_ARTIFACT_SHA256", manifest["artifact_sha256"]),
                         ("NEWS_SOURCE_SHA256", manifest["source_sha256"])):
@@ -357,6 +369,13 @@ def test_runtime(manifest, artifact):
            "import pymysql,requests,lxml.etree,urllib3,playwright.sync_api,tzdata,cryptography;"
            "print('依赖导入检查通过')")
     docker(*common, "--entrypoint", "python", image_name, "-c", STATIC_RUNTIME_CHECK)
+    if manifest.get("external_configuration"):
+        docker(*common, "--entrypoint", "python", image_name, "-c",
+               "import hashlib,os;from pathlib import Path;"
+               "assert hashlib.sha256(Path('/app/news.pyz').read_bytes()).hexdigest()==os.environ['NEWS_ARTIFACT_SHA256'],"
+               "'镜像内程序制品校验失败';"
+               "assert not any(Path('/app/config').iterdir()),'镜像不应包含现场配置';"
+               "print('镜像内程序身份和外置配置边界校验通过')")
     if manifest.get("embedded_configuration"):
         docker(*common, "--entrypoint", "python", image_name, "-c",
                "import hashlib,json,os;from pathlib import Path;"
@@ -376,6 +395,8 @@ def copy_release(source, target, manifest):
              "dockerfile/news/" + manifest["artifact_filename"]]
     if manifest.get("embedded_configuration"):
         names.append("dockerfile/news/news.json")
+    if manifest.get("external_configuration"):
+        names.append(".env.example")
     names += [name for name in manifest["build_inputs"] if name.startswith("dockerfile/news/database/")]
     for name in names:
         incoming = checked_path(source, name)
@@ -559,6 +580,8 @@ def export(root, browser_cache_url=None, python_cache_url=None, apt_cache_proxy=
         if embedded:
             offline["embedded_configuration"] = True
             offline["configuration_sha256"] = manifest["configuration_sha256"]
+        if manifest.get("external_configuration"):
+            offline["external_configuration"] = True
         inspect_loaded(offline, image_id)
         write_json(temporary / "OFFLINE-MANIFEST.json", offline)
         write_shell_scripts(temporary, offline)

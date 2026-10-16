@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""将正式源码和经授权的现场配置构建为身份明确的 Docker 构建目录。"""
+"""将正式源码构建为身份明确的 Docker 构建目录，现场配置在部署时外置挂载。"""
 
 import argparse
 import hashlib
@@ -102,13 +102,9 @@ def read_configuration(path):
     return content, configuration
 
 
-def render_compose(content, version, configuration):
-    """只替换公开版本和挂载路径，不把数据库密码或令牌写入 Compose。"""
-    text = content.decode("utf-8").replace("__BUILD_VERSION__", version)
-    for key, placeholder in (("NEWS_HOST_DATA_DIR", "__HOST_ARCHIVE_DIRECTORY__"),
-                             ("NEWS_DATA_DIR", "__CONTAINER_ARCHIVE_DIRECTORY__")):
-        text = text.replace(placeholder, json.dumps(configuration[key], ensure_ascii=False))
-    return text.encode("utf-8")
+def render_compose(content, version):
+    """替换公开版本，现场共享目录继续由外置配置提供。"""
+    return content.decode("utf-8").replace("__BUILD_VERSION__", version).encode("utf-8")
 
 
 def main():
@@ -118,7 +114,6 @@ def main():
     parser = argparse.ArgumentParser(description="构建正式程序制品和 Docker 构建目录")
     parser.add_argument("--version", required=True, help="目标版本，例如 1.0.0；实际版本追加源码身份")
     parser.add_argument("--output", default="dist", help="交付目录的父路径，默认为 dist")
-    parser.add_argument("--configuration", help="代码和配置内置镜像时必需的私有 JSON 文件；内容不会回显或进入源码 ZIP")
     arguments = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[a-zA-Z0-9][a-zA-Z0-9.-]*)?", arguments.version):
         parser.error("版本必须使用 1.0.0 或 1.0.0-名称 格式")
@@ -135,17 +130,6 @@ def main():
     ]
     # 保留仓库中的甘肃中医药大学历史迁移身份；西安美院制品不交付其他站点的自动脚本。
     snapshot = {path.relative_to(root).as_posix(): path.read_bytes() for path in inputs}
-    configuration_path = None
-    configuration = None
-    if arguments.configuration:
-        configuration_path = Path(arguments.configuration).expanduser().resolve()
-        try:
-            configuration_bytes, configuration = read_configuration(configuration_path)
-        except ValueError as error:
-            parser.error(str(error))
-        snapshot["dockerfile/news/news.json"] = configuration_bytes
-    elif b"COPY news.json " in snapshot["dockerfile/news/Dockerfile"]:
-        parser.error("代码和配置内置镜像必须提供 --configuration 私有现场配置")
     for source in sources:
         compile(snapshot[source.name], source.name, "exec")
 
@@ -159,9 +143,6 @@ def main():
     version = f"{arguments.version}-g{commit[:12]}"
     if dirty:
         version += f"-dirty-{source_hash[:12]}"
-    elif configuration is not None:
-        # 即使仓库干净，不同现场配置也必须生成不同的正式镜像标签。
-        version += f"-configured-{source_hash[:12]}"
     # Docker 标签最多 128 个字符，制品名、内部版本和容器名共用该实际版本。
     if len(version) > 120:
         parser.error("版本名称过长，不能生成一致的 Docker 标签")
@@ -175,12 +156,10 @@ def main():
         "source_sha256": source_hash,
         "python_minimum": "3.12",
         "entrypoint": "MY.py",
+        "external_configuration": True,
         "sources": {source.name: sha256(snapshot[source.name]) for source in sources},
         "build_inputs": {name: sha256(data) for name, data in sorted(snapshot.items())},
     }
-    if configuration is not None:
-        manifest["embedded_configuration"] = True
-        manifest["configuration_sha256"] = sha256(configuration_bytes)
     output_root = Path(arguments.output).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     target = output_root / version
@@ -225,13 +204,7 @@ def main():
         for name in ("Dockerfile", ".dockerignore"):
             (module_directory / name).write_bytes(snapshot[f"dockerfile/news/{name}"])
         (module_directory / "requirements.txt").write_bytes(snapshot["requirements.txt"])
-        if configuration is not None:
-            configuration_copy = module_directory / "news.json"
-            configuration_copy.write_bytes(configuration_bytes)
-            configuration_copy.chmod(0o600)
-        compose = snapshot["docker-compose.yml"]
-        if configuration is not None:
-            compose = render_compose(compose, version, configuration)
+        compose = render_compose(snapshot["docker-compose.yml"], version)
         (temporary / "docker-compose.yml").write_bytes(compose)
         (temporary / "docker-compose.build.yml").write_bytes(snapshot["docker-compose.build.yml"])
         for name in delivery_tools:
@@ -242,6 +215,7 @@ def main():
         example = example.replace("__ARTIFACT_SHA256__", artifact_hash)
         example = example.replace("__SOURCE_SHA256__", source_hash)
         (module_directory / "news.env.example").write_text(example, encoding="utf-8", newline="\n")
+        (temporary / ".env.example").write_text(example, encoding="utf-8", newline="\n")
         (module_directory / "SHA256SUMS").write_text(
             f"{artifact_hash}  {artifact_name}\n", encoding="ascii", newline="\n"
         )
@@ -252,25 +226,23 @@ def main():
             encoding="utf-8", newline="\n"
         )
         for name, data in snapshot.items():
-            current = configuration_path if name == "dockerfile/news/news.json" else root / name
+            current = root / name
             if current.read_bytes() != data:
                 raise SystemExit(f"构建期间源码发生变化，请重新构建：{name}")
-        if configuration is None:
-            with zipfile.ZipFile(temporary_archive, "w") as package:
-                for resource in sorted(temporary.rglob("*")):
-                    if resource.is_file():
-                        write_zip_entry(package, version + "/" + resource.relative_to(temporary).as_posix(),
-                                        resource.read_bytes())
-            with zipfile.ZipFile(temporary_archive) as package:
-                if package.testzip() is not None:
-                    raise SystemExit("部署压缩包内容校验失败")
-            archive_hash = sha256(temporary_archive.read_bytes())
+        with zipfile.ZipFile(temporary_archive, "w") as package:
+            for resource in sorted(temporary.rglob("*")):
+                if resource.is_file():
+                    write_zip_entry(package, version + "/" + resource.relative_to(temporary).as_posix(),
+                                    resource.read_bytes())
+        with zipfile.ZipFile(temporary_archive) as package:
+            if package.testzip() is not None:
+                raise SystemExit("部署压缩包内容校验失败")
+        archive_hash = sha256(temporary_archive.read_bytes())
         temporary.rename(target)
-        if configuration is None:
-            temporary_archive.rename(deployment_archive)
-            archive_checksum.write_text(
-                f"{archive_hash}  {deployment_archive.name}\n", encoding="ascii", newline="\n"
-            )
+        temporary_archive.rename(deployment_archive)
+        archive_checksum.write_text(
+            f"{archive_hash}  {deployment_archive.name}\n", encoding="ascii", newline="\n"
+        )
     except BaseException:
         if (temporary.exists() and temporary.resolve().parent == output_root
                 and temporary.name.startswith(".news-build-")):
@@ -280,7 +252,7 @@ def main():
         raise
     print(json.dumps({"directory": str(target), "version": version,
                       "artifact_sha256": artifact_hash, "source_sha256": source_hash,
-                      "deployment_archive": str(deployment_archive) if configuration is None else None,
+                      "deployment_archive": str(deployment_archive),
                       "deployment_archive_sha256": archive_hash,
                       "git_dirty": dirty}, ensure_ascii=False, indent=2))
 
