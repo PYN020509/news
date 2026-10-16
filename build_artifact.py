@@ -133,7 +133,7 @@ def main():
         root / "docker-compose.yml", root / "docker-compose.build.yml", root / "dockerfile/news/Dockerfile",
         root / "dockerfile/news/.dockerignore", root / "dockerfile/news/news.env.example",
     ]
-    inputs += sorted((root / "dockerfile/news/database").rglob("*.xml"))
+    # 保留仓库中的甘肃中医药大学历史迁移身份；西安美院制品不交付其他站点的自动脚本。
     snapshot = {path.relative_to(root).as_posix(): path.read_bytes() for path in inputs}
     configuration_path = None
     configuration = None
@@ -229,11 +229,6 @@ def main():
             configuration_copy = module_directory / "news.json"
             configuration_copy.write_bytes(configuration_bytes)
             configuration_copy.chmod(0o600)
-        for name, data in snapshot.items():
-            if name.startswith("dockerfile/news/database/"):
-                resource = temporary / name
-                resource.parent.mkdir(parents=True, exist_ok=True)
-                resource.write_bytes(data)
         compose = snapshot["docker-compose.yml"]
         if configuration is not None:
             compose = render_compose(compose, version, configuration)

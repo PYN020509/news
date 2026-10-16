@@ -88,40 +88,27 @@ def load_image_configuration(file_path=None, environment=None):
 
 
 class ConfigManager:
-    """甘肃中医药大学三个归档栏目的配置及兼容访问器。"""
+    """西安美术学院西美要闻栏目的配置及兼容访问器。"""
 
     def __init__(self):
-        base_domain = "https://www.gszy.edu.cn"
+        base_domain = "https://new.xafa.edu.cn"
         self.categories_config = {
-            "学校要闻": {
-                "base_url": f"{base_domain}/reception/news/list/3-10.htm",
-                "list_api": f"{base_domain}/reception/news/list/ajaxNewsList",
-                "detail_api": f"{base_domain}/reception/news/detail/ajaxDetail",
-                "article_url_template": f"{base_domain}/reception/news/detail/{{id}}.htm",
-                "type_param": "newsTypeId", "type_id": "10",
+            "西美要闻": {
+                "slug": "xmyw", "site_name": "西安美术学院新闻网",
+                "base_url": f"{base_domain}/xmyw.htm",
+                "page_url_template": f"{base_domain}/xmyw/{{index}}.htm",
+                "list_xpath": "//ul[contains(concat(' ',normalize-space(@class),' '),' tw-list ')]/li/a",
+                "pagination_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' pb_sys_common ')]",
+                "title_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' art-tit ')]/h3",
+                "metadata_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' art-tit ')]/p/span",
+                "content_xpath": ["//div[contains(concat(' ',normalize-space(@class),' '),' v_news_content ')]"],
                 "date_field": "release_time", "classification": "WY11", "category_code": "01",
-            },
-            "杏林动态": {
-                "base_url": f"{base_domain}/reception/news/list/3-1.htm",
-                "list_api": f"{base_domain}/reception/news/list/ajaxNewsList",
-                "detail_api": f"{base_domain}/reception/news/detail/ajaxDetail",
-                "article_url_template": f"{base_domain}/reception/news/detail/{{id}}.htm",
-                "type_param": "newsTypeId", "type_id": "1",
-                "date_field": "release_time", "classification": "WY12", "category_code": "02",
-            },
-            "通知公告": {
-                "base_url": f"{base_domain}/reception/notice/list/index",
-                "list_api": f"{base_domain}/reception/notice/list/ajaxNoticeList",
-                "detail_api": f"{base_domain}/reception/notice/detail/ajaxDetail",
-                "article_url_template": f"{base_domain}/reception/notice/detail/{{id}}.htm",
-                "type_param": "noticeTypeId", "type_id": "81b537ee8f6c4dc3822efd0ff8c73baf",
-                "date_field": "create_time", "classification": "WY13", "category_code": "03",
             },
         }
         for config in self.categories_config.values():
             config.update({
-                "base_domain": base_domain, "items_per_page": 10, "is_active": True,
-                "valid_url_patterns": [f"{base_domain}/reception/"], "special_handling": {},
+                "base_domain": base_domain, "items_per_page": 5, "is_active": True,
+                "valid_url_patterns": [f"{base_domain}/info/1011/"], "special_handling": {},
             })
 
     def get_active_categories(self) -> Dict[str, Any]:

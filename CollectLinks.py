@@ -6,6 +6,7 @@ from datetime import date
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
+from lxml import etree
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class NewsCollector:
-    """遍历真实列表接口，按发布时间采集三个归档栏目。"""
+    """遍历西美要闻的静态列表，按发布时间采集新闻。"""
 
     def __init__(self, start_date=None, end_date=None, dry_run=False, stop_event=None):
         self.start_date = self._parse_date(start_date) if start_date is not None else None
@@ -36,8 +37,8 @@ class NewsCollector:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.session.headers.update({
-            "User-Agent": "GSZY-ArchiveCollector/1.0", "Accept": "application/json",
-            "Referer": "https://www.gszy.edu.cn/reception/index",
+            "User-Agent": "XAFA-ArchiveCollector/1.0", "Accept": "text/html,application/xhtml+xml",
+            "Referer": "https://new.xafa.edu.cn/xmyw.htm",
         })
         self.base_urls = config_manager.get_active_categories()
         self.discovered_articles = []
@@ -64,7 +65,8 @@ class NewsCollector:
             "start_date": self.start_date.isoformat() if self.start_date is not None else None,
             "end_date": self.end_date.isoformat() if self.end_date is not None else None,
             "dry_run": self.dry_run, "success": False, "matched": 0, "collected": 0,
-            "existing": 0, "failed": 0, "page_failures": 0, "categories": {}, "errors": [],
+            "existing": 0, "skipped": 0, "failed": 0, "page_failures": 0,
+            "categories": {}, "errors": [], "skipped_links": [],
         }
         for category in self.base_urls:
             stats = {
@@ -91,13 +93,13 @@ class NewsCollector:
                 and stats["listed"] == stats["total_reported"]
             )
             logger.info("栏目统计：%s %s", category, stats)
-        for name in ("matched", "collected", "existing", "failed", "page_failures"):
+        for name in ("matched", "collected", "existing", "skipped", "failed", "page_failures"):
             self.summary[name] = sum(stats[name] for stats in self.summary["categories"].values())
         self.summary["success"] = all(stats["complete"] for stats in self.summary["categories"].values())
         return self.summary
 
-    def _post_json(self, url, data):
-        """使用校验证书的 HTTP 请求获取接口数据。"""
+    def _get_html(self, url):
+        """按既有节流和停止机制读取 UTF-8 列表。"""
         self._check_running()
         if self.request_interval:
             if self.stop_event is not None:
@@ -105,32 +107,66 @@ class NewsCollector:
                     raise InterruptedError("服务已接到停止信号，采集任务保持未完成")
             else:
                 time.sleep(self.request_interval)
-        response = self.session.post(url, data=data, timeout=(10, 45))
+        response = self.session.get(url, timeout=(10, 45))
         response.raise_for_status()
-        return response.json()
+        response.encoding = "utf-8"
+        html = etree.HTML(response.text)
+        if html is None:
+            raise ValueError("列表未返回有效 HTML")
+        if urlsplit(response.url).hostname != urlsplit(url).hostname:
+            raise ValueError("列表被重定向至其他网站")
+        return html
 
-    def _request_page(self, config, page):
-        payload = self._post_json(config["list_api"], {
-            config["type_param"]: config["type_id"], "pageNo": page, "title": "",
-        })
-        if not isinstance(payload, dict) or payload.get("code") != 200:
-            raise ValueError(f"列表接口返回错误：{payload!r}")
-        data = payload.get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
-            raise ValueError("列表接口缺少分页数据或文章列表")
-        for key in ("totalRow", "totalPage", "pageNumber", "pageSize"):
-            value = data.get(key)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"列表接口分页字段异常：{key}={value!r}")
-        if data["pageNumber"] != page:
-            raise ValueError(f"请求第 {page} 页却返回第 {data['pageNumber']} 页")
-        if data["totalRow"] and (not data["pageSize"] or not data["totalPage"]):
-            raise ValueError("列表接口总数与分页信息不一致")
-        if data["pageSize"]:
-            expected_pages = (data["totalRow"] + data["pageSize"] - 1) // data["pageSize"]
-            if data["totalPage"] != expected_pages:
-                raise ValueError("列表接口总页数与总条数不一致")
-        return data
+    def _request_page(self, config, page, total_pages=None):
+        """按首页与倒序历史页规则读取，并核对实际页码。"""
+        if page == 1:
+            url = config["base_url"]
+        else:
+            if total_pages is None or not 1 < page <= total_pages:
+                raise ValueError("历史分页缺少有效总页数")
+            url = config["page_url_template"].format(index=total_pages - page + 1)
+        return self._parse_page(self._get_html(url), config, url, page)
+
+    @staticmethod
+    def _parse_page(html, config, url, page):
+        """从分页栏及新闻卡片提取数据，结构异常时保留失败统计。"""
+        pagination = html.xpath(config["pagination_xpath"])
+        if len(pagination) != 1:
+            raise ValueError("列表缺少唯一分页栏")
+        total_text = "".join(pagination[0].xpath(".//span[@class='p_t']//text()"))
+        match = re.fullmatch(r"\s*共\s*(\d+)\s*条\s*", total_text)
+        if not match:
+            raise ValueError("列表总条数格式不正确")
+        total = int(match.group(1))
+        page_size = config["items_per_page"]
+        pages = max((total + page_size - 1) // page_size, 1)
+        current = "".join(pagination[0].xpath(".//span[@class='p_no_d']//text()")).strip()
+        if current != str(page) or not 1 <= page <= pages:
+            raise ValueError(f"请求第 {page} 页却返回第 {current or '未知'} 页")
+        page_labels = pagination[0].xpath(".//span[@class='p_no']/a/text()") + [current]
+        if any(not value.strip().isdigit() for value in page_labels) or max(map(int, page_labels)) != pages:
+            raise ValueError("列表显示的总页数与总条数不一致")
+        next_links = pagination[0].xpath(".//span[contains(concat(' ',normalize-space(@class),' '),' p_next ')]/a/@href")
+        if page < pages:
+            expected_next = config["page_url_template"].format(index=pages - page)
+            if len(next_links) != 1 or urljoin(url, next_links[0]) != expected_next:
+                raise ValueError("列表下页链接与倒序分页规则不一致")
+        elif next_links:
+            raise ValueError("列表尾页仍存在下页链接")
+        items = []
+        for anchor in html.xpath(config["list_xpath"]):
+            href = anchor.get("href") or ""
+            title = (anchor.get("title") or "".join(anchor.xpath(".//h3//text()"))).strip()
+            year_month = "".join(anchor.xpath(".//div[@class='date']/span/text()")).strip()
+            day = "".join(anchor.xpath(".//div[@class='date']/p/text()")).strip()
+            match = re.fullmatch(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", year_month + "." + day)
+            if not href.strip() or not title or not match:
+                raise ValueError("新闻卡片缺少链接、标题或发布日期")
+            published = date(*(int(value) for value in match.groups()))
+            items.append({"url": urljoin(url, href.strip()), "title": title,
+                          config["date_field"]: published.isoformat()})
+        return {"totalRow": total, "totalPage": pages, "pageNumber": page,
+                "pageSize": page_size, "list": items}
 
     def _collect_category(self, category, stats):
         config = config_manager.get_category_config(category)
@@ -144,7 +180,7 @@ class NewsCollector:
         for page in range(1, stats["pages_expected"] + 1):
             try:
                 self._check_running()
-                data = first_page if page == 1 else self._request_page(config, page)
+                data = first_page if page == 1 else self._request_page(config, page, stats["pages_expected"])
                 if data["totalRow"] != stats["total_reported"] or max(data["totalPage"], 1) != stats["pages_expected"]:
                     raise ValueError("采集期间列表总数发生变化，请重新运行以保证完整性")
                 expected_count = min(data["pageSize"], max(data["totalRow"] - (page - 1) * data["pageSize"], 0))
@@ -157,7 +193,7 @@ class NewsCollector:
                 for item in data["list"]:
                     self._process_news_item(item, category, config, stats)
                 if page == 1 or page % 20 == 0 or page == stats["pages_expected"]:
-                    logger.info("列表进度：%s %s/%s 页，范围内 %s 条", category, page,
+                    logger.info("列表进度：%s %s/%s 页，范围内站内新闻 %s 条", category, page,
                                 stats["pages_expected"], stats["matched"])
             except InterruptedError:
                 raise
@@ -180,10 +216,14 @@ class NewsCollector:
             self._check_running()
             if not isinstance(item, dict):
                 raise ValueError("文章列表项必须是对象")
-            article_id = str(item.get("id") or "").strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", article_id):
-                raise ValueError(f"文章编号异常：{article_id!r}")
-            url = self._resolve_link(config["article_url_template"].format(id=article_id), category)
+            url = str(item.get("url") or "").strip()
+            parsed = urlsplit(url)
+            external = (parsed.scheme in ("http", "https") and parsed.hostname
+                        and parsed.hostname != urlsplit(config["base_domain"]).hostname)
+            if not external:
+                url = self._resolve_link(url, category)
+            if not external and not re.fullmatch(r"/info/1011/\d+\.htm", urlsplit(url).path):
+                raise ValueError("文章地址不属于西美要闻详情")
             list_date = self._parse_date(item.get(config["date_field"]) or "")
             key = (category, url)
             if key in self._seen:
@@ -194,6 +234,14 @@ class NewsCollector:
             if ((self.start_date is not None and list_date < self.start_date)
                     or (self.end_date is not None and list_date > self.end_date)):
                 stats["outside_range"] += 1
+                return
+            if external:
+                # 栏目中有直接指向新华网的历史链接，仅记录跳过，不能扩大站点采集范围。
+                stats["skipped"] += 1
+                self.summary["skipped_links"].append({
+                    "category": category, "url": url, "date": list_date.isoformat(),
+                    "title": item.get("title") or "", "reason": "栏目链接指向外部网站，未采集站外正文",
+                })
                 return
             stats["matched"] += 1
             self.discovered_articles.append({

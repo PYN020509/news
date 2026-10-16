@@ -14,8 +14,8 @@ import requests
 from ConfigManager import config_manager
 
 
-ACCESS_TEMPLATE_NAME = "IKKYLJ_甘肃中医药新闻网"
-ARCHIVE_DESCRIPTION = "IKKYLJ：甘肃中医药大学新闻网三个栏目文章归档"
+ACCESS_TEMPLATE_NAME = "xafa_西安美术学院新闻网"
+ARCHIVE_DESCRIPTION = "西安美术学院新闻网西美要闻（xmyw）栏目文章归档"
 
 
 class ArchiveInitializationError(RuntimeError):
@@ -156,7 +156,7 @@ class ArchiveInitializer:
                 raise ArchiveInitializationError(f"专用模板必须配置 {source} → {name} 的直接映射")
         classification = by_name.get("FLH")
         if not classification:
-            raise ArchiveInitializationError("专用模板缺少分类号 → FLH 映射，请先执行 IKKYLJ.xml")
+            raise ArchiveInitializationError("专用模板缺少分类号 → FLH 映射，请先配置当前站点的专用字段模板")
         if classification.get("accessFieldName") == "分类号" and not classification.get("convertType"):
             pass
         elif (classification.get("accessFieldName") == "所属栏目"
@@ -166,9 +166,10 @@ class ArchiveInitializer:
             except (TypeError, ValueError):
                 raise ArchiveInitializationError("分类号枚举映射不是有效 JSON") from None
             if any(values.get(name) != code for name, code in self.categories.items()):
-                raise ArchiveInitializationError("分类号枚举必须对应 WY11、WY12、WY13")
+                expected = "、".join(f"{name} → {code}" for name, code in self.categories.items())
+                raise ArchiveInitializationError("分类号枚举必须对应当前归档栏目：" + expected)
         else:
-            raise ArchiveInitializationError("专用模板分类号转换配置不符合三个归档栏目要求")
+            raise ArchiveInitializationError("专用模板分类号转换配置不符合当前归档栏目要求")
         return template_id, by_name
 
     def _library_nodes(self):

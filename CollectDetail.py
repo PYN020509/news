@@ -19,7 +19,7 @@ import SqlClient
 
 
 logger = logging.getLogger(__name__)
-headers = {"User-Agent": "GSZY-ArchiveCollector/1.0", "Accept": "application/json,text/html,*/*"}
+headers = {"User-Agent": "XAFA-ArchiveCollector/1.0", "Accept": "text/html,application/xhtml+xml,*/*"}
 session = requests.Session()
 session.headers.update(headers)
 session.verify = os.environ.get("NEWS_VERIFY_TLS", "true").lower() not in ("false", "0", "no")
@@ -50,7 +50,53 @@ def _publication_date(value):
 
 
 class Cl:
-    """通过站点的正式数据接口采集详情，沿用新闻表和 PDF 生成器。"""
+    """读取西美要闻详情，沿用新闻表、资源下载和 PDF 生成器。"""
+
+    @staticmethod
+    def _request_article(url, config):
+        """只请求已配置栏目的站内详情，拒绝跨站重定向。"""
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.netloc != urlsplit(config["base_domain"]).netloc
+                or not re.fullmatch(r"/info/1011/\d+\.htm", parsed.path)):
+            raise ValueError("详情地址不属于西美要闻")
+        response = safe_get(url, headers={"Referer": config["base_url"]})
+        if urlsplit(response.url).netloc != parsed.netloc or urlsplit(response.url).path != parsed.path:
+            raise ValueError("详情被重定向至其他页面")
+        return Cl._parse_article(response.content.decode("utf-8-sig"), config, url)
+
+    @staticmethod
+    def _parse_article(content, config, url):
+        """统一解析新旧正文容器，按中文标签提取实际发布日期和来源。"""
+        html = etree.HTML(content)
+        if html is None:
+            raise ValueError("详情未返回有效 HTML")
+        titles = html.xpath(config["title_xpath"])
+        if len(titles) != 1:
+            raise ValueError("详情缺少唯一新闻标题")
+        title = "".join(titles[0].itertext()).strip()
+        if not title:
+            raise ValueError("文章标题为空")
+        article = {"id": Path(urlsplit(url).path).stem, "title": title}
+        fields = {"发布日期": config["date_field"], "作者": "author", "来源": "source", "编辑": "editor"}
+        for node in html.xpath(config["metadata_xpath"]):
+            value = "".join(node.itertext()).strip()
+            match = re.match(r"^(发布日期|作者|来源|编辑)\s*[：:]\s*(.*)$", value, re.S)
+            if match:
+                name, value = match.groups()
+                field = fields[name]
+                if field in article:
+                    raise ValueError("详情元信息重复：" + name)
+                article[field] = value.strip()
+        article[config["date_field"]] = _publication_date(article.get(config["date_field"])).isoformat()
+        bodies = []
+        for xpath in config["content_xpath"]:
+            bodies = html.xpath(xpath)
+            if bodies:
+                break
+        if len(bodies) != 1:
+            raise ValueError("详情缺少唯一新闻正文")
+        article["content_html"] = etree.tostring(bodies[0], encoding="unicode", method="html")
+        return article
 
     @staticmethod
     def Collect_dea(url, category, list_title=None, list_date=None, article_data=None,
@@ -60,20 +106,7 @@ class Cl:
             config = config_manager.get_category_config(category)
             if not config:
                 raise ValueError("未配置的栏目：" + category)
-            source_item = article_data or {}
-            article_id = source_item.get("id")
-            if not article_id:
-                match = re.search(r"/detail/([^/]+)\.htm$", urlsplit(url).path)
-                article_id = match.group(1) if match else None
-            if not article_id:
-                raise ValueError("文章编号缺失")
-            response = session.post(config["detail_api"], data={"id": article_id}, timeout=(10, 30))
-            response.raise_for_status()
-            article = response.json()
-            if not isinstance(article, dict) or not article.get("id"):
-                raise ValueError("详情接口没有返回有效文章")
-            if str(article["id"]) != str(article_id):
-                raise ValueError("详情编号与请求编号不一致")
+            article = Cl._request_article(url, config)
             published = _publication_date(article.get(config["date_field"]))
             if list_date and published != _publication_date(list_date):
                 raise ValueError("列表与详情的发布日期不一致，需重新扫描")
@@ -100,7 +133,7 @@ class Cl:
             if not text and not attachments and not video_items and not (html is not None and html.xpath("//img|//video")):
                 raise ValueError("文章正文及附件均为空")
             article_dir = (Path(os.environ.get("NEWS_DATA_DIR", "/var/lib/news/data"))
-                           / os.environ.get("NEWS_SITE_ID", "gszy") / category / str(published.year)
+                           / os.environ.get("NEWS_SITE_ID", "xafa") / category / str(published.year)
                            / hashlib.sha256(url.encode("utf-8")).hexdigest())
             article_dir.mkdir(parents=True, exist_ok=True)
             images = Cl._save_images(html, article_dir, title, category, url) if html is not None else []
@@ -115,7 +148,7 @@ class Cl:
                     raise RuntimeError("PDF 生成失败，文章未标记为采集成功")
                 documents.insert(0, {title + ".pdf": pdf_path})
             payload = {
-                "网站名称": "甘肃中医药大学新闻网", "网站域名": config["base_domain"],
+                "网站名称": config["site_name"], "网站域名": config["base_domain"],
                 "网址": url, "所属栏目": category, "标题": title,
                 "发布时间": published.isoformat(), "年度": str(published.year),
                 "分类号": config["classification"], "所属栏目编号": config["category_code"],
@@ -145,7 +178,9 @@ class Cl:
         parsed = urlsplit(urljoin(page_url, str(value).strip()))
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError("不支持的资源地址")
-        scheme = "https" if parsed.hostname == "www.gszy.edu.cn" else parsed.scheme
+        site_hosts = {urlsplit(config["base_domain"]).hostname
+                      for config in config_manager.categories_config.values()}
+        scheme = "https" if parsed.hostname in site_hosts else parsed.scheme
         return urlunsplit((scheme, parsed.netloc, re.sub(r"/{2,}", "/", parsed.path), parsed.query, ""))
 
     @staticmethod

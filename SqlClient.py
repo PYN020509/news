@@ -57,7 +57,7 @@ class Cs:
 
     @staticmethod
     def check_archive_ready():
-        """采集前核验三个栏目已注册，防止后台将未绑定记录标记为异常。"""
+        """采集前核验当前启用栏目已注册，防止后台将未绑定记录标记为异常。"""
         from ConfigManager import config_manager
 
         Cs.check_schema()

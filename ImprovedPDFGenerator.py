@@ -180,7 +180,7 @@ class ImprovedPDFGenerator:
 
             # 检查是否为微信公众号，决定使用哪种配置
             is_wechat = self.is_wechat_url(url)
-            is_gszy = urlparse(url).hostname == 'www.gszy.edu.cn'
+            is_xafa = urlparse(url).hostname == 'new.xafa.edu.cn'
 
             if is_wechat:
                 self.logger.info(f"开始生成微信公众号PDF: {url} -> {filepath}")
@@ -255,13 +255,14 @@ class ImprovedPDFGenerator:
                             # 如果网络空闲等待失败，简单等待3秒
                             await page.wait_for_timeout(3000)
 
-                        if is_gszy:
-                            # 正文通过异步接口加载，必须确认文章标题已渲染，不能保存空页面。
+                        if is_xafa:
+                            # 必须确认详情标题和正文存在，不能把错误页面保存为新闻 PDF。
                             await page.wait_for_function(r"""
                                 expected => {
                                     const normalize = text => (text || '').replace(/\s+/g, '').trim();
-                                    return Array.from(document.querySelectorAll('.news-title, h1, h2'))
-                                        .some(node => normalize(node.innerText) === normalize(expected));
+                                    return document.querySelector('.v_news_content')
+                                        && Array.from(document.querySelectorAll('.art-tit h3'))
+                                            .some(node => normalize(node.innerText) === normalize(expected));
                                 }
                             """, arg=title, timeout=timeout)
                             # 站点正文仍有 HTTP 图片地址，统一为本站 HTTPS 后等待资源加载。
@@ -270,7 +271,7 @@ class ImprovedPDFGenerator:
                                     const source = image.getAttribute('data-src') || image.getAttribute('src');
                                     if (!source) return;
                                     const address = new URL(source, location.href);
-                                    if (address.hostname === 'www.gszy.edu.cn') {
+                                    if (address.hostname === 'new.xafa.edu.cn') {
                                         address.protocol = 'https:';
                                         address.pathname = address.pathname.replace(/\/{2,}/g, '/');
                                     }
@@ -279,7 +280,7 @@ class ImprovedPDFGenerator:
                             """)
                             await self.wait_for_images_to_load(page, 30000)
                             missing_images = await page.evaluate("""
-                                () => Array.from((document.querySelector('#news_content') || document.body)
+                                () => Array.from(document.querySelector('.v_news_content')
                                     .querySelectorAll('img')).filter(image =>
                                         !image.complete || image.naturalWidth === 0).length
                             """)

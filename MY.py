@@ -28,7 +28,7 @@ def state_identity():
         "database_host": os.environ.get("NEWS_DB_HOST"),
         "database_port": os.environ.get("NEWS_DB_PORT", "3306"),
         "database_name": os.environ.get("NEWS_DB_NAME"),
-        "site": os.environ.get("NEWS_SITE_ID", "gszy"),
+        "site": os.environ.get("NEWS_SITE_ID", "xafa"),
         "categories": config_manager.categories_config,
     }
     return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -115,7 +115,7 @@ def collect_year(year, dry_run=False, stop_event=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="甘肃中医药大学新闻网归档采集服务")
+    parser = argparse.ArgumentParser(description="西安美术学院新闻网归档采集服务")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="采集后退出，未指定年度时默认采集上一年")
     mode.add_argument("--dry-run", action="store_true", help="只读遍历列表统计，不下载正文、不入库")
