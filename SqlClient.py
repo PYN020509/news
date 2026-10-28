@@ -175,6 +175,80 @@ class Cs:
         return True
 
     @staticmethod
+    def find_existing_article(url, fingerprint=None):
+        """按主网址、转载别名及严格内容指纹查找，遇到多条候选时停止自动合并。"""
+        rows = Cs._select(
+            "SELECT id,url,dict_ FROM news_spider WHERE is_valid_link IS NULL AND "
+            "(url=%s OR CASE WHEN JSON_VALID(dict_) THEN "
+            "JSON_CONTAINS(JSON_EXTRACT(dict_, '$.\"来源网址列表\"'), JSON_QUOTE(%s)) "
+            "ELSE 0 END) LIMIT 2", (url, url),
+        )
+        if not rows and fingerprint:
+            import re
+            if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                raise ValueError("新闻内容指纹必须为完整的 SHA-256")
+            rows = Cs._select(
+                "SELECT id,url,dict_ FROM news_spider WHERE is_valid_link IS NULL AND "
+                "CASE WHEN JSON_VALID(dict_) THEN "
+                "JSON_UNQUOTE(JSON_EXTRACT(dict_, '$.\"内容指纹\"'))=%s "
+                "ELSE 0 END LIMIT 2", (fingerprint,),
+            )
+        if len(rows) > 1:
+            raise RuntimeError("新闻网址或内容指纹对应多条有效记录，请人工核对后再采集")
+        if not rows:
+            return None
+        record_id, main_url, raw_payload = rows[0]
+        payload = json.loads(raw_payload) if isinstance(raw_payload, (str, bytes)) else raw_payload
+        if not isinstance(payload, dict):
+            raise RuntimeError("既有新闻元数据格式不正确，禁止覆盖")
+        return {"id": record_id, "url": main_url, "payload": payload}
+
+    @staticmethod
+    def merge_source_relations(record_id, relations):
+        """在行锁内追加栏目来源，保留既有主分类、档案回写编号及其他元数据。"""
+        from ConfigManager import config_manager
+
+        if not isinstance(relations, list) or any(not isinstance(item, dict) for item in relations):
+            raise ValueError("栏目来源关系必须为对象列表")
+        for relation in relations:
+            category = config_manager.get_category_config(relation.get("栏目"))
+            if (not category or relation.get("分类号") != category["classification"]
+                    or not isinstance(relation.get("网址"), str) or not relation["网址"]):
+                raise ValueError("栏目来源关系缺少有效栏目、分类号或网址")
+        with database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT url,dict_ FROM news_spider WHERE id=%s AND is_valid_link IS NULL FOR UPDATE",
+                    (record_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise RuntimeError("待合并的有效新闻记录不存在")
+                payload = json.loads(row[1]) if isinstance(row[1], (str, bytes)) else row[1]
+                if not isinstance(payload, dict):
+                    raise RuntimeError("既有新闻元数据格式不正确，禁止覆盖")
+                existing = payload.get("栏目来源关系", [])
+                aliases = payload.get("来源网址列表", [])
+                if (not isinstance(existing, list) or any(not isinstance(item, dict) for item in existing)
+                        or not isinstance(aliases, list) or any(not isinstance(item, str) for item in aliases)):
+                    raise RuntimeError("既有新闻来源关系格式不正确，禁止覆盖")
+                merged = list(existing)
+                addresses = list(dict.fromkeys([row[0]] + aliases))
+                for relation in relations:
+                    if relation not in merged:
+                        merged.append(dict(relation))
+                    if relation["网址"] not in addresses:
+                        addresses.append(relation["网址"])
+                if existing == merged and aliases == addresses:
+                    return False
+                payload["栏目来源关系"] = merged
+                payload["来源网址列表"] = addresses
+                cursor.execute("UPDATE news_spider SET dict_=%s WHERE id=%s",
+                               (json.dumps(payload, ensure_ascii=False), record_id))
+            connection.commit()
+            return True
+
+    @staticmethod
     def get_news_by_url(url):
         return Cs._select("SELECT * FROM news_spider WHERE url = %s", (url,), one=True)
 

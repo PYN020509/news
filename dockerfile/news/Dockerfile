@@ -1,6 +1,7 @@
 # 2026-10-12 经官方镜像仓库核验的 Python 运行时摘要。
 # 联网机器完成全部依赖安装后导出 AMD64 镜像，现场只导入和运行。
-FROM python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+ARG NEWS_PYTHON_BASE=python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+FROM ${NEWS_PYTHON_BASE}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -48,8 +49,10 @@ ARG NEWS_RUN_UID=10001
 ARG NEWS_RUN_GID=10001
 
 # 现场配置由 Compose 只读挂载，不进入镜像或构建上下文。
-COPY --chown=${NEWS_RUN_UID}:${NEWS_RUN_GID} --chmod=0444 news-${NEWS_VERSION}.pyz /app/news.pyz
-RUN chown "${NEWS_RUN_UID}:${NEWS_RUN_GID}" /home/news /var/lib/news/data /var/lib/news/state \
+COPY --chown=${NEWS_RUN_UID}:${NEWS_RUN_GID} news-${NEWS_VERSION}.pyz /app/news.pyz
+# 兼容现场 Docker 20 的经典构建器，权限在同一正式层中显式固定。
+RUN chmod 0444 /app/news.pyz \
+    && chown "${NEWS_RUN_UID}:${NEWS_RUN_GID}" /home/news /var/lib/news/data /var/lib/news/state \
     && chmod 0750 /var/lib/news/state
 
 ENV NEWS_CONFIG_FILE=/app/config/news.env \

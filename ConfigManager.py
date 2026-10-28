@@ -88,27 +88,37 @@ def load_image_configuration(file_path=None, environment=None):
 
 
 class ConfigManager:
-    """西安美术学院西美要闻栏目的配置及兼容访问器。"""
+    """神木职业技术学院四个采集栏目的配置及兼容访问器。"""
 
     def __init__(self):
-        base_domain = "https://new.xafa.edu.cn"
+        base_domain = "https://www.smzy.edu.cn"
+        # 仅修正已按官网文件、尺寸及 CMS 标识核验的一张历史图片，不推导其他内网资源。
+        self.asset_url_overrides = {
+            "http://172.18.18.12:8080/_vsl/2E5DCCB62AA6624D2AF6A5DD85C97C6D/9C712FA6/A92A5":
+                "https://www.smzy.edu.cn/__local/2/E5/DC/CB62AA6624D2AF6A5DD85C97C6D_9C712FA6_A92A5.png",
+        }
         self.categories_config = {
-            "西美要闻": {
-                "slug": "xmyw", "site_name": "西安美术学院新闻网",
-                "base_url": f"{base_domain}/xmyw.htm",
-                "page_url_template": f"{base_domain}/xmyw/{{index}}.htm",
-                "list_xpath": "//ul[contains(concat(' ',normalize-space(@class),' '),' tw-list ')]/li/a",
-                "pagination_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' pb_sys_common ')]",
-                "title_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' art-tit ')]/h3",
-                "metadata_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' art-tit ')]/p/span",
-                "content_xpath": ["//div[contains(concat(' ',normalize-space(@class),' '),' v_news_content ')]"],
-                "date_field": "release_time", "classification": "WY11", "category_code": "01",
-            },
+            "学院要闻": {"slug": "xwzx/xyxw", "node_id": "1421", "classification": "WY11", "category_code": "01"},
+            "通知公告": {"slug": "xwzx/tzgg", "node_id": "1431", "classification": "WY12", "category_code": "02"},
+            "党建动态": {"slug": "djdt", "node_id": "1501", "classification": "WY13", "category_code": "03"},
+            "在线视频": {"slug": "zxsp", "node_id": "1451", "classification": "WY14", "category_code": "04"},
         }
         for config in self.categories_config.values():
             config.update({
-                "base_domain": base_domain, "items_per_page": 5, "is_active": True,
-                "valid_url_patterns": [f"{base_domain}/info/1011/"], "special_handling": {},
+                "site_name": "神木职业技术学院", "base_domain": base_domain,
+                "base_url": f"{base_domain}/{config['slug']}.htm",
+                "page_url_template": f"{base_domain}/{config['slug']}/{{index}}.htm",
+                "list_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' list ')]/ul/li/a[@href]",
+                "pagination_xpath": "//div[contains(concat(' ',normalize-space(@class),' '),' pb_sys_common ')]",
+                "title_xpath": ["//form[@name='_newscontent_fromname']//h2[@class='tit']",
+                                "//form[@name='_newscontent_fromname']//div[@class='detail_title']",
+                                "//meta[@name='pageTitle']/@content"],
+                "metadata_xpath": "//form[@name='_newscontent_fromname']//p[@class='wzxx']|//form[@name='_newscontent_fromname']//div[@class='detail_extend']",
+                "content_xpath": ["//div[contains(concat(' ',normalize-space(@class),' '),' v_news_content ')]"],
+                "date_field": "release_time", "items_per_page": 10, "is_active": True,
+                # 部门子站仅处理四个列表实际引用的详情，不遍历部门栏目。
+                "detail_path_pattern": r"/(?:[A-Za-z0-9_-]+/)?info/\d+/\d+\.htm",
+                "valid_url_patterns": [base_domain + "/"], "special_handling": {},
             })
 
     def get_active_categories(self) -> Dict[str, Any]:

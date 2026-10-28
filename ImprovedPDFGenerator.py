@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
 import hashlib
+from ConfigManager import config_manager
 
 try:
     from playwright.async_api import async_playwright, Browser, Page
@@ -181,6 +182,8 @@ class ImprovedPDFGenerator:
             # 检查是否为微信公众号，决定使用哪种配置
             is_wechat = self.is_wechat_url(url)
             is_xafa = urlparse(url).hostname == 'new.xafa.edu.cn'
+            host = urlparse(url).hostname or ''
+            is_smzy = host == 'smzy.edu.cn' or host.endswith('.smzy.edu.cn')
 
             if is_wechat:
                 self.logger.info(f"开始生成微信公众号PDF: {url} -> {filepath}")
@@ -207,6 +210,10 @@ class ImprovedPDFGenerator:
                     )
                     
                     page = await context.new_page()
+                    if is_smzy:
+                        # 视频原件由采集下载器独立归档，生成页面副本时不重复加载大视频。
+                        await page.route('**/*', lambda route: route.abort()
+                                         if route.request.resource_type == 'media' else route.continue_())
                     
                     # 导航到页面
                     self.logger.info(f"导航到页面: {url}")
@@ -255,30 +262,94 @@ class ImprovedPDFGenerator:
                             # 如果网络空闲等待失败，简单等待3秒
                             await page.wait_for_timeout(3000)
 
-                        if is_xafa:
+                        if is_xafa or is_smzy:
                             # 必须确认详情标题和正文存在，不能把错误页面保存为新闻 PDF。
                             await page.wait_for_function(r"""
                                 expected => {
                                     const normalize = text => (text || '').replace(/\s+/g, '').trim();
                                     return document.querySelector('.v_news_content')
-                                        && Array.from(document.querySelectorAll('.art-tit h3'))
+                                        && Array.from(document.querySelectorAll('.art-tit h3, h2.tit, .detail_title'))
                                             .some(node => normalize(node.innerText) === normalize(expected));
                                 }
                             """, arg=title, timeout=timeout)
+                            if is_smzy:
+                                # 官网以固定高度的 PDF.js iframe 预览附件；展开其官方预览图，避免副本只保留首屏。
+                                # 原始 PDF 已由采集下载器独立保存，此处只调整待打印页面的展示。
+                                await page.evaluate(r"""
+                                    () => {
+                                        const body = document.querySelector('.v_news_content');
+                                        for (const script of body.querySelectorAll('script')) {
+                                            const text = script.textContent || '';
+                                            const pdf = text.match(/showVsbpdfIframe\(\s*["']([^"']+)["']/i);
+                                            if (!pdf) continue;
+                                            const data = text.match(/\bvsb_pdf_image_data\s*=\s*(\[[\s\S]*?\])\s*;/);
+                                            if (!data) throw new Error('原始 PDF 缺少官方预览图片数组');
+                                            const images = JSON.parse(data[1]);
+                                            if (!Array.isArray(images) || images.length === 0
+                                                || images.some(value => typeof value !== 'string' || !value.trim())) {
+                                                throw new Error('原始 PDF 的官方预览图片数组无效');
+                                            }
+                                            const preview = document.createElement('div');
+                                            preview.setAttribute('data-news-original-pdf-preview', 'true');
+                                            preview.style.cssText = 'width:100%;height:auto;overflow:visible;text-indent:0';
+                                            images.forEach((source, index) => {
+                                                const image = document.createElement('img');
+                                                image.src = new URL(source, location.href).href;
+                                                image.alt = '原始 PDF 第 ' + (index + 1) + ' 页';
+                                                image.style.cssText = 'display:block;width:100%;height:auto;margin:0 auto';
+                                                preview.appendChild(image);
+                                            });
+                                            for (const frame of script.parentElement.querySelectorAll('iframe')) {
+                                                const address = new URL(frame.getAttribute('src') || '', location.href);
+                                                const original = address.searchParams.get('file');
+                                                if (original === pdf[1] || address.pathname === new URL(pdf[1], location.href).pathname) {
+                                                    frame.remove();
+                                                }
+                                            }
+                                            script.insertAdjacentElement('afterend', preview);
+                                        }
+                                    }
+                                """)
                             # 站点正文仍有 HTTP 图片地址，统一为本站 HTTPS 后等待资源加载。
                             await page.evaluate(r"""
-                                () => document.querySelectorAll('img').forEach(image => {
+                                overrides => document.querySelectorAll('img').forEach(image => {
                                     const source = image.getAttribute('data-src') || image.getAttribute('src');
                                     if (!source) return;
-                                    const address = new URL(source, location.href);
-                                    if (address.hostname === 'new.xafa.edu.cn') {
+                                    let address = new URL(source, location.href);
+                                    if (location.hostname === 'www.smzy.edu.cn' && overrides[address.href]) {
+                                        // 精确映射已核验的历史图片，并在打印 DOM 保留原始来源地址。
+                                        image.setAttribute('data-news-original-src', address.href);
+                                        address = new URL(overrides[address.href]);
+                                    }
+                                    if (address.hostname === 'new.xafa.edu.cn'
+                                        || address.hostname === 'smzy.edu.cn'
+                                        || address.hostname.endsWith('.smzy.edu.cn')) {
                                         address.protocol = 'https:';
                                         address.pathname = address.pathname.replace(/\/{2,}/g, '/');
                                     }
                                     image.src = address.href;
                                 })
-                            """)
-                            await self.wait_for_images_to_load(page, 30000)
+                            """, arg=config_manager.asset_url_overrides)
+                            if is_smzy:
+                                # 采集页面副本时直接请求正文原图，避免逐像素滚动拖慢历史全量。
+                                await page.evaluate(r"""
+                                    () => {
+                                        document.querySelectorAll('.v_news_content img').forEach(image => {
+                                            image.loading = 'eager';
+                                            // 最终图片地址已在上方统一规范化，不能再用旧 data-src 覆盖。
+                                        });
+                                        window.scrollTo(0, document.body.scrollHeight);
+                                        window.scrollTo(0, 0);
+                                    }
+                                """)
+                                await page.wait_for_function("""
+                                    () => Array.from(document.querySelector('.v_news_content')
+                                        .querySelectorAll('img')).every(image =>
+                                            image.complete && image.naturalWidth > 0)
+                                """, timeout=45000)
+                                await page.evaluate("document.fonts.ready")
+                            else:
+                                await self.wait_for_images_to_load(page, 30000)
                             missing_images = await page.evaluate("""
                                 () => Array.from(document.querySelector('.v_news_content')
                                     .querySelectorAll('img')).filter(image =>

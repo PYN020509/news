@@ -6,6 +6,7 @@
 import hashlib
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -14,8 +15,22 @@ import requests
 from ConfigManager import config_manager
 
 
-ACCESS_TEMPLATE_NAME = "xafa_西安美术学院新闻网"
-ARCHIVE_DESCRIPTION = "西安美术学院新闻网西美要闻（xmyw）栏目文章归档"
+ACCESS_TEMPLATE_NAME = "smzy_神木职业技术学院网页采集"
+ARCHIVE_DESCRIPTION = "神木职业技术学院学院要闻、通知公告、党建动态和在线视频归档"
+ARCHIVE_FIELDS = (
+    "DH", "QZH", "ND", "FLH", "JH", "ZTM", "SSLM", "FBSJ", "ZZ", "LAIY", "CJR", "CJSJ",
+    "WZ", "ZY", "JTXWNR", "ZRBJ", "WZMC", "WZYM", "SSLMBH", "SPIDERID", "FTM", "BGQX",
+    "WH", "ZRZ", "MJ", "GDDW", "YS", "LRSJ", "GK", "BGHMJ", "XCBGQX", "YJBM", "JSBM",
+    "YJR", "JSR", "YJSJ", "YJSM", "GDRQ",
+)
+LIST_FIELDS = ("DH", "ND", "FLH", "ZTM", "SSLM", "FBSJ", "ZZ", "LAIY", "CJR", "CJSJ")
+SOURCE_FIELDS = {
+    "WZMC": "网站名称", "WZYM": "网站域名", "SSLM": "所属栏目", "ZTM": "标题", "WZ": "网址",
+    "ZRBJ": "编辑", "FBSJ": "发布时间", "ZZ": "作者", "ZY": "摘要", "JTXWNR": "具体新闻内容",
+    "CJSJ": "采集时间", "LAIY": "来源", "ND": "年度", "SSLMBH": "所属栏目编号", "FLH": "分类号",
+    "CJR": "采集人",
+    "QZH": "全宗号",
+}
 
 
 class ArchiveInitializationError(RuntimeError):
@@ -37,6 +52,9 @@ class ArchiveInitializer:
         if self.parent_id == 0:
             raise ArchiveInitializationError("父库编号必须为 -1 或实际存在的正整数")
         self.template_table_id = self._integer("ERMS_TEMPLATE_TABLE_ID")
+        # 显式指定时只接入该既有业务库，绝不按名称查找或另建替代库。
+        self.library_table_id = (self._integer("ERMS_LIBRARY_TABLE_ID")
+                                 if self.environment.get("ERMS_LIBRARY_TABLE_ID", "").strip() else None)
         self.fond_id = self._integer("ERMS_FOND_ID")
         self.data_status = self._required("ERMS_DATA_STATUS")
         self.library_name = self.environment.get("ERMS_LIBRARY_NAME", "新闻网文章采集")
@@ -116,6 +134,12 @@ class ArchiveInitializer:
         table = self._api("GET", f"/library/table/{table_id}")
         if not isinstance(table, dict) or table.get("id") != table_id:
             raise ArchiveInitializationError(f"库编号 {table_id} 不存在或无权访问")
+        fond_id = table.get("fondId")
+        if isinstance(fond_id, str):
+            # 现场 Long 字段序列化为十进制字符串，仅规范类型，不改动原响应对象。
+            if not fond_id.isascii() or not fond_id.isdecimal():
+                raise ArchiveInitializationError("库所属全宗编号不是有效十进制整数")
+            table = {**table, "fondId": int(fond_id)}
         return table
 
     def _fields(self, table_name):
@@ -130,14 +154,39 @@ class ArchiveInitializer:
             raise ArchiveInitializationError("库字段定义中存在重复字段名称")
         return {name: row for name, row in zip(names, rows)}
 
-    def _mapping(self):
+    def _backup(self, label, value):
+        """每次业务配置写入前保存现场完整对象，备份文件不包含登录凭据。"""
+        directory = self.state_file.parent / "archive-backups"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + label + ".json"
+        target = directory / name
+        with target.open("x", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, indent=2)
+        target.chmod(0o600)
+
+    def _mapping(self, source_fields):
+        """通过既有业务接口补齐本站专用映射，已有不同配置须先人工核对。"""
+        qzh = source_fields.get("QZH") or {}
+        qzh_value = qzh.get("initValue")
+        if qzh.get("initType") != "fixed" or not isinstance(qzh_value, str) or not qzh_value.strip():
+            raise ArchiveInitializationError("网页归档库全宗号必须配置非空固定值，不能依赖采集归档流程自动套用字段默认值")
         templates = self._list(self._api(
             "GET", "/admin/bizAccessTemplate/list",
             params={"templateName": self.access_template_name},
         ), "业务接入模板")
-        template = self._one([
+        candidates = [
             row for row in templates if row.get("templateName") == self.access_template_name
-        ], "新闻网专用业务接入模板")
+        ]
+        if not candidates:
+            self._backup("access-template-before", {"templates": templates})
+            self._api("POST", "/admin/bizAccessTemplate", body={
+                "templateName": self.access_template_name, "remark": ARCHIVE_DESCRIPTION,
+            })
+            candidates = [row for row in self._list(self._api(
+                "GET", "/admin/bizAccessTemplate/list",
+                params={"templateName": self.access_template_name},
+            ), "业务接入模板") if row.get("templateName") == self.access_template_name]
+        template = self._one(candidates, "新闻网专用业务接入模板")
         template_id = template.get("id")
         if not isinstance(template_id, int) or template_id <= 0:
             raise ArchiveInitializationError("业务接入模板编号不合法")
@@ -149,6 +198,49 @@ class ArchiveInitializer:
         if len(set(names)) != len(names):
             raise ArchiveInitializationError("新闻网专用模板中存在重复字段映射")
         by_name = dict(zip(names, fields))
+        expected_fields = {}
+        for order, (name, source) in enumerate(SOURCE_FIELDS.items(), start=1):
+            expected = {
+                "templateId": template_id, "fieldName": name,
+                "fieldCName": source_fields[name].get("fieldCName") or source,
+                "accessFieldName": source, "accessFieldCName": source, "orderd": order,
+            }
+            if name == "CJR":
+                expected.update({"convertType": "fixed", "convertValue": "档案馆"})
+            elif name == "QZH":
+                expected.update({"convertType": "fixed", "convertValue": qzh_value})
+            else:
+                expected.update({"convertType": None, "convertValue": None})
+            existing = by_name.get(name)
+            if existing and any(existing.get(key) != expected[key] for key in (
+                    "accessFieldName", "convertType", "convertValue")):
+                # 空转换参数与未设置等价；不把旧的固定值或枚举映射悄悄改为直取。
+                if not (name not in ("CJR", "QZH") and existing.get("accessFieldName") == source
+                        and not existing.get("convertType") and not existing.get("convertValue")):
+                    raise ArchiveInitializationError("本站已有不同字段映射，禁止覆盖：" + name)
+            expected_fields[name] = expected
+        if set(by_name) - set(expected_fields):
+            raise ArchiveInitializationError("本站专用模板含有方案外的映射，须先核对影响范围")
+        missing_fields = [row for name, row in expected_fields.items() if name not in by_name]
+        if missing_fields:
+            self._backup("access-fields-before", {"template": template, "fields": fields})
+            for row in missing_fields:
+                self._api("POST", "/admin/bizAccessField", body=row)
+            fields = self._list(self._api(
+                "GET", "/admin/bizAccessField/list", params={"templateId": template_id},
+            ), "业务接入字段映射")
+            by_name = {}
+            for row in fields:
+                name = str(row.get("fieldName", "")).upper()
+                if name in by_name or row.get("templateId") != template_id:
+                    raise ArchiveInitializationError("字段映射回读存在重复或模板身份不一致")
+                by_name[name] = row
+            for name, expected in expected_fields.items():
+                row = by_name.get(name, {})
+                if (row.get("accessFieldName") != expected["accessFieldName"]
+                        or (row.get("convertType") or None) != expected["convertType"]
+                        or (row.get("convertValue") or None) != expected["convertValue"]):
+                    raise ArchiveInitializationError("字段映射回读不一致：" + name)
         required = {"ZTM": "标题", "WZ": "网址", "ND": "年度", "JTXWNR": "具体新闻内容"}
         for name, source in required.items():
             field = by_name.get(name)
@@ -171,6 +263,43 @@ class ArchiveInitializer:
         else:
             raise ArchiveInitializationError("专用模板分类号转换配置不符合当前归档栏目要求")
         return template_id, by_name
+
+    def _configure_layout(self, table_name, fields):
+        """仅更新本站目标库的显隐和顺序，结构、默认值及隐藏业务规则保持现场配置。"""
+        updates = []
+        expected_by_name = {}
+        if "ID" in fields:
+            # 系统主键保留结构，但不能额外占用方案约定的列表、编辑和查询显示项。
+            expected_by_name["ID"] = {"hideListFlag": 1, "hideEditFlag": 1, "hideSelectFlag": 1}
+            if any(fields["ID"].get(key) != value for key, value in expected_by_name["ID"].items()):
+                updates.append({"id": fields["ID"]["id"], "tableName": table_name, **expected_by_name["ID"]})
+        for order, name in enumerate(ARCHIVE_FIELDS, start=1):
+            row = fields[name]
+            expected = {
+                "hideListFlag": 0 if name in LIST_FIELDS else 1,
+                "hideEditFlag": 0 if order <= 18 else 1,
+                "hideSelectFlag": 0 if order <= 18 and name not in ("QZH", "JH") else 1,
+                "orderNumEdit": order,
+                "orderNumList": LIST_FIELDS.index(name) + 1 if name in LIST_FIELDS else order + 10,
+            }
+            if name in ("QZH", "JH"):
+                expected["disEditFlag"] = 1
+            expected_by_name[name] = expected
+            if any(row.get(key) != value for key, value in expected.items()):
+                updates.append({"id": row["id"], "tableName": table_name, **expected})
+        if updates:
+            self._backup("library-fields-before", fields)
+            if self._fields(table_name) != fields:
+                raise ArchiveInitializationError("目标库字段在备份后发生并发修改，已停止配置")
+            self._api("POST", "/library/table/field/updateBatch",
+                      params={"personalFlag": "0"}, body=updates)
+            confirmed = self._fields(table_name)
+            if self._structure(confirmed) != self._structure(fields):
+                raise ArchiveInitializationError("字段布局更新影响了业务结构，请保留备份并检查")
+            for name, expected in expected_by_name.items():
+                if any(confirmed[name].get(key) != value for key, value in expected.items()):
+                    raise ArchiveInitializationError("字段布局回读不一致：" + name)
+        return {"businessFields": 38, "listVisible": 10, "editVisible": 18, "queryVisible": 16}
 
     def _library_nodes(self):
         result = self._api("GET", "/library/table/treeList/ER")
@@ -200,6 +329,7 @@ class ArchiveInitializer:
         return {
             "baseUrl": self.base_url, "parentId": self.parent_id, "fondId": self.fond_id,
             "sourceTemplateId": self.template_table_id, "libraryName": self.library_name,
+            "targetLibraryId": self.library_table_id,
             "accessTemplateName": self.access_template_name, "dataStatus": self.data_status,
         }
 
@@ -236,10 +366,16 @@ class ArchiveInitializer:
         if template.get("fondId") not in (None, self.fond_id):
             raise ArchiveInitializationError("模板库所属全宗与 ERMS_FOND_ID 不一致")
         source_fields = self._fields(template["wjTableName"])
-        access_template_id, mapping = self._mapping()
-        missing = set(mapping) - set(source_fields)
-        if missing:
-            raise ArchiveInitializationError("网页采集模板缺少字段：" + "、".join(sorted(missing)))
+        if set(source_fields) - {"ID"} != set(ARCHIVE_FIELDS):
+            raise ArchiveInitializationError("请先选定包含方案中完整38项业务字段的网页模板库")
+        if (source_fields["DH"].get("initType") != "comb"
+                or source_fields["DH"].get("initValue") != "[QZH]-[ND]-[FLH]-[JH]"):
+            raise ArchiveInitializationError("模板档号组合规则应为 [QZH]-[ND]-[FLH]-[JH]")
+        import re
+        if (source_fields["JH"].get("initType") != "comb"
+                or not re.fullmatch(r"\$max\[\d+\]\(QZH,\s*ND,\s*FLH\)",
+                                    source_fields["JH"].get("initValue") or "")):
+            raise ArchiveInitializationError("模板件号须沿用按全宗号、年度、分类号分组递增的规则")
         source_structure = self._structure(source_fields)
         fingerprint = hashlib.sha256(json.dumps(
             source_structure, sort_keys=True, ensure_ascii=False,
@@ -247,9 +383,17 @@ class ArchiveInitializer:
         if state and state.get("sourceStructureSha256") != fingerprint:
             raise ArchiveInitializationError("模板库字段结构已变化，请先检查现有归档库兼容性")
 
-        nodes = self._library_nodes()
-        matches = [node for node in nodes
-                   if node.get("pid") == self.parent_id and node.get("title") == self.library_name]
+        if self.library_table_id is not None:
+            selected = self._table(self.library_table_id)
+            if (selected.get("tableTypeCode") != "ER" or selected.get("relateType") != "WJM"
+                    or selected.get("pid") != self.parent_id or selected.get("fondId") != self.fond_id
+                    or selected.get("wjTableName") != f"d_wj_{self.library_table_id}"):
+                raise ArchiveInitializationError("指定归档库的编号、父节点、全宗、管理方式或动态表名不一致")
+            matches = [{"tableId": self.library_table_id}]
+        else:
+            nodes = self._library_nodes()
+            matches = [node for node in nodes
+                       if node.get("pid") == self.parent_id and node.get("title") == self.library_name]
         bindings = self._list(self._api("GET", "/admin/bizAccess/list", params={
             "clientKey": "spider_news", "apiKey": "spider_user",
         }), "新闻采集接入配置")
@@ -259,9 +403,20 @@ class ArchiveInitializer:
                 raise ArchiveInitializationError(f"栏目 {category} 已有重复接入配置，禁止继续初始化")
             if configured and not matches:
                 raise ArchiveInitializationError(f"栏目 {category} 已绑定其他库，禁止创建重复归档库")
+            if self.library_table_id is not None and configured and (
+                    configured[0].get("tableId") != self.library_table_id
+                    or configured[0].get("tableName") != f"d_wj_{self.library_table_id}"):
+                raise ArchiveInitializationError(f"栏目 {category} 已绑定其他归档库，禁止覆盖")
         if len(matches) > 1:
             raise ArchiveInitializationError("同一父节点下存在多个同名归档库，禁止重复创建")
+        # 模板及既有绑定的只读兼容检查完成后，才允许建立接收字段模板。
+        access_template_id, mapping = self._mapping(source_fields)
+        missing = set(mapping) - set(source_fields)
+        if missing:
+            raise ArchiveInitializationError("网页采集模板缺少字段：" + "、".join(sorted(missing)))
         if not matches:
+            if self.library_table_id is not None:
+                raise ArchiveInitializationError("指定归档库不存在，禁止按名称新建替代库")
             if state:
                 raise ArchiveInitializationError("状态文件指定的归档库已不存在，禁止自动创建替代库")
             maximum = self._api("GET", "/library/table/getMaxOrderd", params={
@@ -279,7 +434,9 @@ class ArchiveInitializer:
         library = self._table(library_id)
         if (library.get("tableTypeCode") != "ER" or library.get("relateType") != "WJM"
                 or library.get("pid") != self.parent_id or library.get("fondId") != self.fond_id
-                or library.get("description") != ARCHIVE_DESCRIPTION):
+                or (self.library_table_id is None and library.get("description") != ARCHIVE_DESCRIPTION)
+                or (self.library_table_id is not None and (
+                    library_id != self.library_table_id or library.get("wjTableName") != f"d_wj_{self.library_table_id}"))):
             raise ArchiveInitializationError("同名归档库的身份或管理方式不一致，禁止改写现场库")
         if state and state.get("libraryId") != library_id:
             raise ArchiveInitializationError("现有归档库编号与初始化状态文件不一致")
@@ -289,6 +446,7 @@ class ArchiveInitializer:
         target_fields = self._fields(table_name)
         if self._structure(target_fields) != source_structure:
             raise ArchiveInitializationError("现有归档库与模板字段不一致，请检查建库或引用模板结果")
+        layout = self._configure_layout(table_name, target_fields)
         statuses = self._list(self._api(
             "GET", f"/library/table/field/{library_id}/dataStatusMapping",
         ), "归档库数据状态")
@@ -297,6 +455,7 @@ class ArchiveInitializer:
         state = {
             "identity": self._identity(), "libraryId": library_id, "tableName": table_name,
             "accessTemplateId": access_template_id, "sourceStructureSha256": fingerprint,
+            "fieldLayout": layout,
             "categories": state.get("categories", {}) if state else {},
         }
         self._save_state(state)

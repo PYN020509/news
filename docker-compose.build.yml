@@ -5,6 +5,8 @@ services:
       context: ./dockerfile/news
       dockerfile: Dockerfile
       args:
+        # 离线载入时可传入已逐层核验的同一官方镜像 ID，避免再次访问仓库。
+        NEWS_PYTHON_BASE: ${NEWS_PYTHON_BASE:-python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36}
         NEWS_VERSION: ${NEWS_VERSION:?请先配置制品版本}
         NEWS_ARTIFACT_SHA256: ${NEWS_ARTIFACT_SHA256:?请先配置制品校验值}
         NEWS_SOURCE_SHA256: ${NEWS_SOURCE_SHA256:?请先配置源码校验值}
